@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 暗色主题：铺满视口外的滚动区域（overscroll）也保持深色 */
+html {
+  background-color: #0a0a0a; /* neutral-950 */
+  color-scheme: dark;
+}

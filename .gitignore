@@ -1,0 +1,12 @@
+/triggerlink
+/triggerlink.db
+/triggerlink.db-wal
+/triggerlink.db-shm
+/pipeline
+sdk-ts/node_modules/
+sdk-ts/dist/
+.worktrees/
+
+# 内部设计文档（不对外发布，本地保留）
+docs/triggerlink-prd.md
+docs/superpowers/
