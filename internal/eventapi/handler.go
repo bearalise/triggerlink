@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/ids"
-	"github.com/triggerlink/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/store"
 )
 
 // Handler 处理 POST /v1/events。

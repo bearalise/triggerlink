@@ -146,8 +146,8 @@ import (
     "log"
     "net/http"
 
-    triggerlink "github.com/triggerlink/triggerlink/sdk"
-    "github.com/triggerlink/triggerlink/sdk/step"
+    triggerlink "github.com/bearalise/triggerlink/sdk"
+    "github.com/bearalise/triggerlink/sdk/step"
 )
 
 func main() {

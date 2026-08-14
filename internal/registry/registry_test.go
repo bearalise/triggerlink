@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/sign"
+	"github.com/bearalise/triggerlink/internal/sign"
 )
 
 func TestMatchAndLookup(t *testing.T) {

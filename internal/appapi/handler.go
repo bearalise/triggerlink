@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/registry"
+	"github.com/bearalise/triggerlink/internal/registry"
 )
 
 // Handler 处理 /api/v1/apps 与 /api/v1/apps/sync。

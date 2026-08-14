@@ -13,16 +13,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/appapi"
-	"github.com/triggerlink/triggerlink/internal/auth"
-	"github.com/triggerlink/triggerlink/internal/dashapi"
-	"github.com/triggerlink/triggerlink/internal/eventapi"
-	"github.com/triggerlink/triggerlink/internal/executor"
-	"github.com/triggerlink/triggerlink/internal/registry"
-	"github.com/triggerlink/triggerlink/internal/runner"
-	"github.com/triggerlink/triggerlink/internal/store"
-	triggerlink "github.com/triggerlink/triggerlink/sdk"
-	"github.com/triggerlink/triggerlink/sdk/step"
+	"github.com/bearalise/triggerlink/internal/appapi"
+	"github.com/bearalise/triggerlink/internal/auth"
+	"github.com/bearalise/triggerlink/internal/dashapi"
+	"github.com/bearalise/triggerlink/internal/eventapi"
+	"github.com/bearalise/triggerlink/internal/executor"
+	"github.com/bearalise/triggerlink/internal/registry"
+	"github.com/bearalise/triggerlink/internal/runner"
+	"github.com/bearalise/triggerlink/internal/store"
+	triggerlink "github.com/bearalise/triggerlink/sdk"
+	"github.com/bearalise/triggerlink/sdk/step"
 )
 
 type stack struct {

@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/triggerlink/triggerlink/sdk/internal/execx"
-	"github.com/triggerlink/triggerlink/sdk/step"
+	"github.com/bearalise/triggerlink/sdk/internal/execx"
+	"github.com/bearalise/triggerlink/sdk/step"
 )
 
 func signHeader(key string, body []byte) string {

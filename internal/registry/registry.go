@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/sign"
+	"github.com/bearalise/triggerlink/internal/sign"
 )
 
 // Function 是一个已注册的 durable 函数的路由条目。

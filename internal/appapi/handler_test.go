@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/registry"
-	"github.com/triggerlink/triggerlink/internal/sign"
+	"github.com/bearalise/triggerlink/internal/registry"
+	"github.com/bearalise/triggerlink/internal/sign"
 )
 
 // fakeApp 模拟一个 SDK 应用 serve 端点：验签后返回给定的函数清单。

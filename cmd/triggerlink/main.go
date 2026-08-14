@@ -11,16 +11,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/appapi"
-	"github.com/triggerlink/triggerlink/internal/auth"
-	"github.com/triggerlink/triggerlink/internal/dashapi"
-	"github.com/triggerlink/triggerlink/internal/dashboard"
-	"github.com/triggerlink/triggerlink/internal/eventapi"
-	"github.com/triggerlink/triggerlink/internal/executor"
-	"github.com/triggerlink/triggerlink/internal/ids"
-	"github.com/triggerlink/triggerlink/internal/registry"
-	"github.com/triggerlink/triggerlink/internal/runner"
-	"github.com/triggerlink/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/appapi"
+	"github.com/bearalise/triggerlink/internal/auth"
+	"github.com/bearalise/triggerlink/internal/dashapi"
+	"github.com/bearalise/triggerlink/internal/dashboard"
+	"github.com/bearalise/triggerlink/internal/eventapi"
+	"github.com/bearalise/triggerlink/internal/executor"
+	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/registry"
+	"github.com/bearalise/triggerlink/internal/runner"
+	"github.com/bearalise/triggerlink/internal/store"
 )
 
 type stringSlice []string

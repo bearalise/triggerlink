@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/ids"
-	"github.com/triggerlink/triggerlink/internal/registry"
-	"github.com/triggerlink/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/registry"
+	"github.com/bearalise/triggerlink/internal/store"
 )
 
 // Runner 消费 stream 中的事件并路由。

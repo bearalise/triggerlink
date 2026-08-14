@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/registry"
-	"github.com/triggerlink/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/registry"
+	"github.com/bearalise/triggerlink/internal/store"
 )
 
 // Handler 处理 /api/v1/{events,functions,runs} 只读端点。

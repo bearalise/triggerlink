@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"runtime/debug"
 
-	"github.com/triggerlink/triggerlink/sdk/internal/execx"
+	"github.com/bearalise/triggerlink/sdk/internal/execx"
 )
 
 // sdkVersion 上报给平台内省清单。

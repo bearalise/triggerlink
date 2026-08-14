@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/registry"
-	"github.com/triggerlink/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/registry"
+	"github.com/bearalise/triggerlink/internal/store"
 )
 
 type env struct {

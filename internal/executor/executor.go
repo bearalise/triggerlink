@@ -16,10 +16,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/triggerlink/triggerlink/internal/ids"
-	"github.com/triggerlink/triggerlink/internal/registry"
-	"github.com/triggerlink/triggerlink/internal/sign"
-	"github.com/triggerlink/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/registry"
+	"github.com/bearalise/triggerlink/internal/sign"
+	"github.com/bearalise/triggerlink/internal/store"
 )
 
 // Executor 执行队列中的 run。

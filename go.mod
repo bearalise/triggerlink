@@ -1,4 +1,4 @@
-module github.com/triggerlink/triggerlink
+module github.com/bearalise/triggerlink
 
 go 1.23
 

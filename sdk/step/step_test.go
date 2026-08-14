@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/triggerlink/triggerlink/sdk/internal/execx"
+	"github.com/bearalise/triggerlink/sdk/internal/execx"
 )
 
 // capture 在 execx 上下文中调用 fn 并 recover 出 opcode（模拟 serve 的中断机制）。

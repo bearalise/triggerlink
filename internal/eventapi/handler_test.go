@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/triggerlink/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/store"
 )
 
 func setup(t *testing.T) (*Handler, store.Store, chan store.Event) {
