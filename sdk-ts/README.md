@@ -8,7 +8,7 @@ Inngest-style DX. See the protocol spec at
 ## Integrating with Next.js (App Router)
 
 ```bash
-npm install @triggerlink/sdk   # prototype stage: use npm link or a file: dependency within this repo
+npm install @triggerlink/sdk
 ```
 
 ```ts

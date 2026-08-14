@@ -22,7 +22,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Richardo1o1/TriggerLink.git",
+    "url": "git+https://github.com/bearalise/triggerlink.git",
     "directory": "sdk-ts"
   },
   "devDependencies": {
