@@ -1,7 +1,16 @@
 {
   "name": "@triggerlink/sdk",
-  "version": "0.3.1",
-  "description": "TriggerLink TypeScript SDK (M0 prototype): durable functions for Next.js / Node.js",
+  "version": "0.3.2",
+  "description": "TriggerLink TypeScript SDK: durable, crash-recoverable functions for Next.js / Node.js",
+  "keywords": [
+    "triggerlink",
+    "durable-execution",
+    "workflow",
+    "background-jobs",
+    "event-driven",
+    "step-functions",
+    "nextjs"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -19,7 +28,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test \"test/*.test.mjs\""
+    "test": "npm run build && node --test \"test/*.test.mjs\"",
+    "prepublishOnly": "npm run build"
   },
   "license": "MIT",
   "repository": {
