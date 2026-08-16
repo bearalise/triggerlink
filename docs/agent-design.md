@@ -107,7 +107,7 @@ interface AgentResult {
 }
 ```
 
-Dependencies: `ai` and `zod` become **peer dependencies** of `@triggerlink/sdk`. Provider packages (`@ai-sdk/anthropic`, `@ai-sdk/openai`, …) stay user-installed, so the SDK carries no provider code.
+Dependencies: `ai` and the three built-in provider packages (`@ai-sdk/anthropic`, `@ai-sdk/openai`, `@ai-sdk/deepseek`) are **regular dependencies** of `@triggerlink/sdk` — bundled for zero-extra-install DX (revised in v0.4.1; the original optional-peer design made every agent user hand-install four packages). `zod` stays an **optional peer dependency**: it appears only in user code (tool schemas) and in types, never at SDK runtime. Other providers remain usable by passing any AI SDK `LanguageModel` as `model`.
 
 ## 4. Execution Model
 
@@ -217,7 +217,7 @@ The `llm` step memo output includes `usage` per call; `AgentResult.usage` aggreg
 | File | Change |
 |---|---|
 | `sdk-ts/src/agent.ts` | New: `createAgent`, loop implementation, types (~250 lines) |
-| `sdk-ts/package.json` | Add `./agent` subpath export; add `ai`, `zod` as **optional** peer deps (`peerDependenciesMeta`); version bump |
+| `sdk-ts/package.json` | Add `./agent` subpath export; `ai` + built-in providers as regular deps, `zod` as optional peer (revised in v0.4.1, see §3); version bump |
 | `sdk-ts/test/agent.test.mjs` | New tests |
 | `sdk-ts/README.md` | Agent section with quickstart |
 | `examples/nextjs/` (or new `examples/agent/`) | Minimal agent example app |
@@ -230,8 +230,8 @@ No changes under `internal/`, `cmd/`, or `sdk/` (Go).
 
 **Decided: ship in the existing `@triggerlink/sdk` package as a subpath export `@triggerlink/sdk/agent` — not a separate package.**
 
-- The agent module must **not** be re-exported from `index.ts`: that would make the main entry transitively import `ai`, breaking non-agent users who don't have it installed. A subpath export isolates the `ai`/`zod` imports behind `import { createAgent } from "@triggerlink/sdk/agent"`.
-- `ai` and `zod` are optional peer dependencies: agent users install them (plus their provider package, e.g. `@ai-sdk/anthropic`); non-agent users install nothing extra.
+- The agent module must **not** be re-exported from `index.ts`: a subpath export isolates the `ai`/provider imports behind `import { createAgent } from "@triggerlink/sdk/agent"`, so non-agent users never load that code at runtime (install size grows, runtime does not).
+- Dependency layout (revised in v0.4.1): `ai` and the three built-in providers are regular dependencies — bundled so agent users need no extra installs beyond `zod` (optional peer, used for tool schemas). The v0.4.0 layout (everything an optional peer) forced four manual installs per agent user and was reversed after first use.
 - Same-package release keeps the agent loop atomically in sync with the `StepTool`/`ExecCtx` memo semantics it depends on, and fits the current manual publish flow (`prepublishOnly` build → `npm publish` from `sdk-ts/`; no CI release pipeline exists yet). Splitting into `@triggerlink/agent` later remains possible — the subpath import keeps that migration to one line for users.
 
 ## 9. Milestones
@@ -244,7 +244,7 @@ No changes under `internal/`, `cmd/`, or `sdk/` (Go).
 
 - **Thin wrapper over AgentKit** (`step.run` around `network.run`): near-zero effort, but inherits coarse recovery granularity and an upstream project whose release cadence has slowed. Rejected as the long-term answer; acceptable as a stopgap.
 - **Vendoring AgentKit source** (Apache 2.0): full control, but we would own an unmaintained framework including abstractions (Network/Router/State) that duplicate TriggerLink's own function model. Rejected.
-- **Hand-written provider adapters** instead of the Vercel AI SDK: avoids a dependency but we would re-implement and maintain per-provider request/response/tool-call normalization — exactly the layer the AI SDK already solves well. Rejected; the AI SDK is a peer dep, so non-agent users pay nothing.
+- **Hand-written provider adapters** instead of the Vercel AI SDK: avoids a dependency but we would re-implement and maintain per-provider request/response/tool-call normalization — exactly the layer the AI SDK already solves well. Rejected.
 
 ## 11. Open Questions
 

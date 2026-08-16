@@ -276,3 +276,15 @@ test("createAgent 参数校验", () => {
   assert.throws(() => createAgent({ name: "a/b", model }), /must not contain/);
   assert.throws(() => createAgent({ name: "ok", model, maxIterations: 0 }), /positive integer/);
 });
+
+test("内置 provider：anthropic/openai/deepseek 开箱构造 LanguageModel", async () => {
+  const { anthropic, openai, deepseek, createDeepSeek } = await import("../dist/agent.js");
+  const a = anthropic("claude-sonnet-4-5");
+  assert.equal(a.provider, "anthropic.messages");
+  assert.equal(a.modelId, "claude-sonnet-4-5");
+  assert.equal(openai("gpt-4o").provider, "openai.responses");
+  assert.equal(deepseek("deepseek-chat").provider, "deepseek.chat");
+  // createXxx 支持自定义配置（如 baseURL / apiKey）
+  const custom = createDeepSeek({ apiKey: "k", baseURL: "https://example.com/v1" });
+  assert.equal(custom("deepseek-chat").modelId, "deepseek-chat");
+});

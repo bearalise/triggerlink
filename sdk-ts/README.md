@@ -73,14 +73,18 @@ Built on the [Vercel AI SDK](https://github.com/vercel/ai) for multi-provider
 support; design details in [`docs/agent-design.md`](../docs/agent-design.md).
 
 ```bash
-npm install @triggerlink/sdk ai zod @ai-sdk/anthropic   # or another AI SDK provider
+npm install @triggerlink/sdk zod   # zod is for tool schemas; ai + providers are bundled
 ```
 
 ```ts
 import { createFunction } from "@triggerlink/sdk";
-import { createAgent } from "@triggerlink/sdk/agent";   // subpath import, not the main entry
-import { anthropic } from "@ai-sdk/anthropic";
+import { createAgent, anthropic } from "@triggerlink/sdk/agent";   // subpath import, not the main entry
 import { z } from "zod";
+
+// Built-in providers, zero extra installs: anthropic / openai / deepseek
+// (plus createAnthropic / createOpenAI / createDeepSeek for custom baseURL/apiKey).
+// Default instances read ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY from the env.
+// Any other AI SDK LanguageModel can still be passed as `model` directly.
 
 const researcher = createAgent({
   name: "researcher",                    // stable ID, used in memo keys — do not rename casually
@@ -123,7 +127,7 @@ Notes:
   callback timeout (5 minutes by default); two different agents in one function must have
   different `name`s; changing the tool set or loop structure between retries of the same run
   can misalign memo keys (changing prompt text is safe).
-- The `ai` and `zod` packages are optional peer dependencies — only agent users install them.
+- `ai` and the three built-in providers are regular dependencies of the SDK (bundled, no extra install); `zod` is an optional peer dependency — install it if you define tool schemas.
 
 ## Sending events (any TS code, modeled after Inngest's `inngest.send`)
 

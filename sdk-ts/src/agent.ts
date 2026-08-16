@@ -13,6 +13,14 @@ import {
 import type { ZodType } from "zod";
 import type { StepTool } from "./step.js";
 
+// 内置 provider，开箱即用：默认实例从环境变量读 API key
+// （ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY）；
+// 需要自定义 baseURL/apiKey/代理时用 createXxx 构造专属实例。
+// 其余 provider 不受影响：createAgent 的 model 接受任意 AI SDK LanguageModel。
+export { anthropic, createAnthropic } from "@ai-sdk/anthropic";
+export { openai, createOpenAI } from "@ai-sdk/openai";
+export { deepseek, createDeepSeek } from "@ai-sdk/deepseek";
+
 /** Agent 工具定义。parameters 为 zod schema；handler 入参是 schema parse 后的值。 */
 export interface AgentTool<P = unknown, R = unknown> {
   description: string;
