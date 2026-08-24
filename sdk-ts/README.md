@@ -128,6 +128,7 @@ Notes:
   different `name`s; changing the tool set or loop structure between retries of the same run
   can misalign memo keys (changing prompt text is safe).
 - `ai` and the three built-in providers are regular dependencies of the SDK (bundled, no extra install); `zod` is an optional peer dependency — install it if you define tool schemas.
+- **HTTP proxies**: if your environment routes external traffic through `http_proxy`/`https_proxy`, note that Node's global `fetch` ignores them by default — LLM calls will fail with `AI_APICallError: Cannot connect to API`. On Node 24+, start your app with `node --use-env-proxy`; on older Node, install `undici` and set `setGlobalDispatcher(new EnvHttpProxyAgent())` before serving.
 
 ## Sending events (any TS code, modeled after Inngest's `inngest.send`)
 
