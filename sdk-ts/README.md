@@ -78,7 +78,7 @@ npm install @triggerlink/sdk zod   # zod is for tool schemas; ai + providers are
 
 ```ts
 import { createFunction } from "@triggerlink/sdk";
-import { createAgent, anthropic } from "@triggerlink/sdk/agent";   // subpath import, not the main entry
+import { createAgent, createTool, anthropic } from "@triggerlink/sdk/agent";   // subpath import, not the main entry
 import { z } from "zod";
 
 // Built-in providers, zero extra installs: anthropic / openai / deepseek
@@ -86,17 +86,20 @@ import { z } from "zod";
 // Default instances read ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY from the env.
 // Any other AI SDK LanguageModel can still be passed as `model` directly.
 
+// createTool is a generic factory: the zod schema's type flows into the handler's
+// params — annotate nothing. Plain object literals also work; use createTool when
+// sharing a tool across agents.
+const searchKb = createTool({
+  description: "Search the knowledge base",
+  parameters: z.object({ query: z.string() }),
+  handler: async ({ query }) => kb.search(query),   // query: string, inferred
+});
+
 const researcher = createAgent({
   name: "researcher",                    // stable ID, used in memo keys — do not rename casually
   model: anthropic("claude-sonnet-4-5"), // any AI SDK LanguageModel
   system: "You are a research assistant. Answer concisely.",
-  tools: {
-    search: {
-      description: "Search the knowledge base",
-      parameters: z.object({ query: z.string() }),
-      handler: async ({ query }) => kb.search(query),
-    },
-  },
+  tools: { search: searchKb },
   maxIterations: 10,                     // safety cap; the run fails when exceeded
 });
 

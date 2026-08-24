@@ -79,6 +79,10 @@ interface AgentTool<P = unknown, R = unknown> {
   handler: (params: P) => Promise<R> | R;
 }
 
+// Generic factory: makes the zod schema's type flow into the handler params.
+// Plain literals also work; createTool exists for inference and cross-agent sharing.
+declare function createTool<P, R>(def: AgentTool<P, R>): AgentTool<P, R>;
+
 interface AgentOpts {
   name: string;                        // unique per function (see §5.2)
   model: LanguageModel;                // from the `ai` package

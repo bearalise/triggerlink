@@ -28,6 +28,17 @@ export interface AgentTool<P = unknown, R = unknown> {
   handler: (params: P) => Promise<R> | R;
 }
 
+/**
+ * 定义一个 Agent 工具（泛型工厂）：让 zod schema 的类型流到 handler 入参。
+ * 与直接写字面量等价，但获得完整的类型推断；跨 Agent 复用工具时也应使用它。
+ */
+export function createTool<P, R>(def: AgentTool<P, R>): AgentTool<P, R> {
+  if (!def.description) throw new Error("createTool: description is required");
+  if (!def.parameters) throw new Error("createTool: parameters is required");
+  if (typeof def.handler !== "function") throw new Error("createTool: handler is required");
+  return def;
+}
+
 /** redact 钩子的上下文（§5.7）。 */
 export interface RedactCtx {
   /** 产生输出的 step 类型 */
@@ -52,7 +63,8 @@ export interface AgentOpts {
   /** AI SDK 的 LanguageModel（用户自带 provider 包，如 @ai-sdk/anthropic） */
   model: LanguageModel;
   system?: string;
-  tools?: Record<string, AgentTool>;
+  // eslint 友好起见用 any：具体 P/R 由 createTool 在定义处完成推断，此处只承载运行时分发
+  tools?: Record<string, AgentTool<any, any>>;
   /** 迭代上限（一次迭代 = 一次 LLM 调用 + 其全部工具执行），默认 10；超限抛错使 run 失败 */
   maxIterations?: number;
   redact?: RedactHook;

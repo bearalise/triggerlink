@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { MockLanguageModelV4 } from "ai/test";
 import { z } from "zod";
-import { createAgent } from "../dist/agent.js";
+import { createAgent, createTool } from "../dist/agent.js";
 import { StepInterrupt } from "../dist/execx.js";
 import { ExecCtx } from "../dist/execx.js";
 import { createStepTool } from "../dist/step.js";
@@ -275,6 +275,27 @@ test("createAgent 参数校验", () => {
   assert.throws(() => createAgent({ name: "", model }), /name is required/);
   assert.throws(() => createAgent({ name: "a/b", model }), /must not contain/);
   assert.throws(() => createAgent({ name: "ok", model, maxIterations: 0 }), /positive integer/);
+});
+
+test("createTool：工厂定义的工具与字面量等价，且可跨 Agent 复用", async () => {
+  const shared = createTool({
+    description: "Search the knowledge base",
+    parameters: z.object({ query: z.string() }),
+    handler: ({ query }) => `result:${query}`,
+  });
+  assert.throws(() => createTool({ description: "", parameters: z.object({}), handler: () => 1 }), /description/);
+
+  const model = new MockLanguageModelV4({
+    doGenerate: [
+      toolCallsResult([{ id: "c1", name: "search", input: { query: "x" } }]),
+      textResult("done"),
+    ],
+  });
+  const agent = createAgent({ name: "ct", model, tools: { search: shared } });
+  const { result } = await drive(agent, "q");
+  assert.equal(result.text, "done");
+  const toolMsg = model.doGenerateCalls[1].prompt.findLast((m) => m.role === "tool");
+  assert.deepEqual(toolMsg.content[0].output, { type: "json", value: "result:x" });
 });
 
 test("内置 provider：anthropic/openai/deepseek 开箱构造 LanguageModel", async () => {
