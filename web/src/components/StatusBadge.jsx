@@ -3,6 +3,7 @@ const STYLES = {
   running: { dot: 'bg-blue-400 animate-pulse', text: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-800' },
   completed: { dot: 'bg-emerald-400', text: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-800' },
   failed: { dot: 'bg-red-400', text: 'text-red-400', bg: 'bg-red-500/10 border-red-800' },
+  cancelled: { dot: 'bg-zinc-500', text: 'text-zinc-400', bg: 'bg-zinc-500/10 border-zinc-700' },
 }
 
 const FALLBACK = { dot: 'bg-neutral-400', text: 'text-neutral-300', bg: 'bg-neutral-500/10 border-neutral-700' }

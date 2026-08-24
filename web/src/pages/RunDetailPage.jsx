@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { fetchRun } from '../api'
+import { fetchRun, cancelRun } from '../api'
 import { usePolling } from '../usePolling'
 import StatusBadge from '../components/StatusBadge'
 import JsonTree from '../components/JsonTree'
@@ -125,6 +125,8 @@ function StepBar({ index, step, startMs, endMs, t0, range }) {
 export default function RunDetailPage() {
   const { id } = useParams()
   const [terminal, setTerminal] = useState(false)
+  const [stopping, setStopping] = useState(false)
+  const [stopError, setStopError] = useState(null)
   useEffect(() => setTerminal(false), [id])
   const { data, offline } = usePolling(
     async () => {
@@ -144,12 +146,37 @@ export default function RunDetailPage() {
     return <div className="text-neutral-500">Loading…</div>
   }
   const { run, steps } = data
+
+  const onStop = async () => {
+    if (!window.confirm(`Stop run ${run.id}? It will be marked as cancelled and no further steps will run.`)) return
+    setStopping(true)
+    setStopError(null)
+    try {
+      await cancelRun(run.id)
+      // 状态由下一轮轮询(≤2s)收敛为 cancelled 并停止轮询
+    } catch (e) {
+      setStopError(e.message)
+    } finally {
+      setStopping(false)
+    }
+  }
+
   return (
     <div className="space-y-4">
       {offline && <div className={bannerCls}>Connection lost, retrying…</div>}
+      {stopError && <div className={bannerCls}>Stop failed: {stopError}</div>}
       <div className="flex items-center gap-3">
         <h1 className="text-lg font-semibold font-mono text-white">{run.id}</h1>
         <StatusBadge status={run.status} />
+        {ACTIVE.has(run.status) && (
+          <button
+            onClick={onStop}
+            disabled={stopping}
+            className="ml-auto rounded-md border border-red-800 bg-red-500/10 px-3 py-1 text-sm text-red-400 hover:bg-red-500/20 disabled:opacity-50"
+          >
+            {stopping ? 'Stopping…' : 'Stop run'}
+          </button>
+        )}
       </div>
       <div className="text-sm text-neutral-400 space-x-4">
         <span>Function <span className="font-mono text-neutral-200">{run.function_id}</span></span>

@@ -160,7 +160,7 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		return
 	}
-	if run.Status == store.RunCompleted || run.Status == store.RunFailed {
+	if run.Status == store.RunCompleted || run.Status == store.RunFailed || run.Status == store.RunCancelled {
 		e.Store.CompleteQueueItem(ctx, item.ID) // 终态 run 的残留队列项，清扫
 		return
 	}
@@ -176,7 +176,17 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.Store.ReleaseLease(ctx, item.ID, time.Now().Add(e.BaseBackoff))
 		return
 	}
-	e.Store.MarkRunRunning(ctx, run.ID)
+	running, err := e.Store.MarkRunRunning(ctx, run.ID)
+	if err != nil {
+		log.Printf("executor: mark running %s: %v", run.ID, err)
+		e.Store.ReleaseLease(ctx, item.ID, time.Now().Add(e.BaseBackoff))
+		return
+	}
+	if !running {
+		// dispatch 启动期间 run 已到终态（如被取消）：放弃回调，收尾队列项。
+		e.Store.CompleteQueueItem(ctx, item.ID)
+		return
+	}
 
 	// sleep 唤醒转换：到达唤醒时刻的 dispatch 把 sleeping memo 置为 completed，
 	// 使应用重入时 sleep step 命中 memo 直接返回（幂等；顺序执行下至多一个 sleeping step）
@@ -225,6 +235,13 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	var op opcode
 	if err := json.Unmarshal(respBody, &op); err != nil {
 		e.retryOrFail(ctx, item, run, attempt, "decode opcode: "+err.Error())
+		return
+	}
+
+	// 回调在途期间 run 可能被取消：推进/重试前重检状态，取消则丢弃 opcode 收尾。
+	if latest, err := e.Store.GetRun(ctx, run.ID); err == nil && latest.Status == store.RunCancelled {
+		e.Store.CompleteQueueItem(ctx, item.ID)
+		log.Printf("executor: run %s cancelled in flight, discarding %s", run.ID, op.Op)
 		return
 	}
 

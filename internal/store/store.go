@@ -17,6 +17,7 @@ const (
 	RunRunning   = "Running"
 	RunCompleted = "Completed"
 	RunFailed    = "Failed"
+	RunCancelled = "Cancelled" // 终态：dashboard/API 主动取消（FR：run 取消）
 )
 
 // Step Run 状态。
@@ -97,9 +98,10 @@ type Store interface {
 
 	CreateRun(ctx context.Context, r Run) error
 	GetRun(ctx context.Context, id string) (Run, error)
-	MarkRunRunning(ctx context.Context, id string) error
+	MarkRunRunning(ctx context.Context, id string) (bool, error)
 	CompleteRun(ctx context.Context, id string, output json.RawMessage) error
 	FailRun(ctx context.Context, id string, errMsg string) error
+	CancelRun(ctx context.Context, id string) (bool, error)
 	IncrementRunAttempt(ctx context.Context, id string) (int, error)
 	CountRuns(ctx context.Context) (int, error)
 	CountRunsWithStatus(ctx context.Context, status string) (int, error)
@@ -323,10 +325,17 @@ func (s *SQLiteStore) GetRun(ctx context.Context, id string) (Run, error) {
 	return r, nil
 }
 
-// MarkRunRunning 将 run 置为 Running。
-func (s *SQLiteStore) MarkRunRunning(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE runs SET status=? WHERE id=?`, RunRunning, id)
-	return err
+// MarkRunRunning 将非终态 run 置为 Running；返回 false 表示 run 已处终态
+// （如回调启动前被取消），调用方应放弃本次 dispatch。
+func (s *SQLiteStore) MarkRunRunning(ctx context.Context, id string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE runs SET status=? WHERE id=? AND status NOT IN (?,?,?)`,
+		RunRunning, id, RunCompleted, RunFailed, RunCancelled)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // CompleteRun 落终态 Completed + 输出。
@@ -343,6 +352,34 @@ func (s *SQLiteStore) FailRun(ctx context.Context, id string, errMsg string) err
 		`UPDATE runs SET status=?, error=?, ended_at=? WHERE id=?`,
 		RunFailed, errMsg, fmtTime(time.Now()), id)
 	return err
+}
+
+// CancelRun 把 Queued/Running 的 run 置为终态 Cancelled，并同事务删除其 pending 队列项
+// （防止 executor 再次拉起）。返回 transitioned=false 表示 run 已处终态（幂等）。
+// 注意：可能有一个 leased 项正在回调途中，由 executor 在回调返回后重检 run 状态兜底。
+func (s *SQLiteStore) CancelRun(ctx context.Context, id string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE runs SET status=?, ended_at=? WHERE id=? AND status IN (?,?)`,
+		RunCancelled, fmtTime(time.Now()), id, RunQueued, RunRunning)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 1 {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM queue_items WHERE run_id=? AND status=?`, id, QueuePending); err != nil {
+			return false, err
+		}
+	}
+	return n == 1, tx.Commit()
 }
 
 // IncrementRunAttempt 尝试计数 +1 并返回新值（M0：step 与 run 重试共用该计数）。

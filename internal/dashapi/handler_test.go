@@ -206,3 +206,50 @@ func TestMethodAndNotFound(t *testing.T) {
 		t.Fatalf("unknown: %d", rec.Code)
 	}
 }
+
+func TestCancelRunEndpoint(t *testing.T) {
+	h, st, _ := newTestHandler(t)
+	ctx := context.Background()
+	if err := st.CreateRun(ctx, store.Run{
+		ID: "run_c1", FunctionID: "fn-a", EventID: "evt_c1",
+		EventName: "e/x", EventData: json.RawMessage(`{}`), EventTS: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.MarkRunRunning(ctx, "run_c1"); err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// running → cancelled
+	rec := post("/api/v1/runs/run_c1/cancel")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cancel: %d %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Run runDTO `json:"run"`
+	}
+	decode(t, rec, &out)
+	if out.Run.Status != "cancelled" || out.Run.EndedAt == nil {
+		t.Fatalf("cancelled dto: %+v", out.Run)
+	}
+
+	// 已终态 → 409;不存在 → 404
+	if rec := post("/api/v1/runs/run_c1/cancel"); rec.Code != http.StatusConflict {
+		t.Fatalf("re-cancel: %d", rec.Code)
+	}
+	if rec := post("/api/v1/runs/run_none/cancel"); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing: %d", rec.Code)
+	}
+	// GET 打到 cancel 后缀路径 → 视为 getRun(id="run_c1/cancel") → 404
+	if rec := doGet(t, h, "/api/v1/runs/run_c1/cancel"); rec.Code != http.StatusNotFound {
+		t.Fatalf("get cancel path: %d", rec.Code)
+	}
+}

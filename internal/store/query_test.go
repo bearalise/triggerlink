@@ -17,7 +17,7 @@ func seedRunRec(t *testing.T, st *SQLiteStore, id, fnID, status, eventID string)
 	}
 	switch status {
 	case RunRunning:
-		if err := st.MarkRunRunning(ctx, id); err != nil {
+		if _, err := st.MarkRunRunning(ctx, id); err != nil {
 			t.Fatal(err)
 		}
 	case RunCompleted:

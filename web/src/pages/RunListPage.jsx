@@ -47,7 +47,7 @@ export default function RunListPage() {
         </select>
         <select value={status} onChange={(e) => setStatus(e.target.value)} className={selectCls}>
           <option value="">All statuses</option>
-          {['queued', 'running', 'completed', 'failed'].map((s) => (
+          {['queued', 'running', 'completed', 'failed', 'cancelled'].map((s) => (
             <option key={s} value={s}>{s}</option>
           ))}
         </select>

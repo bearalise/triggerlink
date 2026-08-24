@@ -1,4 +1,5 @@
-// Package dashapi 实现 Dashboard 的只读管理 API（PRD 9.3，P0 只读为主）。
+// Package dashapi 实现 Dashboard 的管理 API（PRD 9.3）：以只读端点为主，
+// 另提供 POST /api/v1/runs/{id}/cancel 用于主动取消在途 run。
 // 鉴权由外层中间件负责（internal/auth），本包不含鉴权逻辑。
 package dashapi
 
@@ -30,6 +31,7 @@ func NewHandler(st store.Store, reg *registry.Registry) *Handler {
 var statusToStore = map[string]string{
 	"queued": store.RunQueued, "running": store.RunRunning,
 	"completed": store.RunCompleted, "failed": store.RunFailed,
+	"cancelled": store.RunCancelled,
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -43,11 +45,17 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	// 唯一的写端点：取消 run（其余全部为只读 GET）
+	if r.Method == http.MethodPost && strings.HasSuffix(path, "/cancel") &&
+		strings.HasPrefix(path, "/api/v1/runs/") {
+		h.cancelRun(w, r, strings.TrimSuffix(strings.TrimPrefix(path, "/api/v1/runs/"), "/cancel"))
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	path := r.URL.Path
 	switch {
 	case path == "/api/v1/events":
 		h.listEvents(w, r)
@@ -235,6 +243,37 @@ func (h *Handler) getRun(w http.ResponseWriter, r *http.Request, id string) {
 		},
 		"steps": steps,
 	})
+}
+
+// cancelRun 处理 POST /api/v1/runs/{id}/cancel：把 Queued/Running 的 run 置为终态
+// Cancelled 并清掉其 pending 队列项；已终态返回 409（幂等语义交给客户端判断）。
+func (h *Handler) cancelRun(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "run id required")
+		return
+	}
+	if _, err := h.st.GetRun(r.Context(), id); errors.Is(err, sql.ErrNoRows) {
+		writeErr(w, http.StatusNotFound, "run not found")
+		return
+	} else if err != nil {
+		writeErr(w, http.StatusInternalServerError, "get run")
+		return
+	}
+	transitioned, err := h.st.CancelRun(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "cancel run")
+		return
+	}
+	if !transitioned {
+		writeErr(w, http.StatusConflict, "run already in terminal state")
+		return
+	}
+	run, err := h.st.GetRun(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "get run")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run": toRunDTO(run)})
 }
 
 func (h *Handler) listFunctions(w http.ResponseWriter, r *http.Request) {

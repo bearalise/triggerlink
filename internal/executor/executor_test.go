@@ -293,3 +293,34 @@ func TestStepErrorThenRecover(t *testing.T) {
 		t.Fatalf("step: %+v", steps["h1"])
 	}
 }
+
+// 取消语义：被取消 run 的队列项(含取消前已 leased、被对账重置回 pending 的)不得再触发回调。
+func TestCancelledRunNotDispatched(t *testing.T) {
+	var calls atomic.Int32
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		json.NewEncoder(w).Encode(map[string]any{"op": "RunComplete", "output": map[string]any{}})
+	})
+	e := newEnv(t, app)
+	e.seedRun(t)
+	if ok, err := e.store.CancelRun(context.Background(), "run_1"); err != nil || !ok {
+		t.Fatalf("cancel: ok=%v err=%v", ok, err)
+	}
+	// 模拟竞态：取消前已 leased 的项被重启对账重置回 pending(等价于再入队一个)
+	if err := e.store.Enqueue(context.Background(), store.QueueItem{ID: "qi_2", FunctionID: "fn",
+		RunID: "run_1", Score: time.Now().UnixNano(), At: time.Now(), Status: store.QueuePending}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.exec.Run(ctx)
+
+	time.Sleep(300 * time.Millisecond)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("cancelled run dispatched %d times", n)
+	}
+	r, _ := e.store.GetRun(context.Background(), "run_1")
+	if r.Status != store.RunCancelled {
+		t.Fatalf("status=%s, want Cancelled", r.Status)
+	}
+}

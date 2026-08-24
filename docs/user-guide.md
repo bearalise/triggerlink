@@ -124,14 +124,17 @@ The platform ships with a built-in Dashboard at `http://localhost:8288/dashboard
 - Credential configuration: the `-dashboard-auth user:password` startup flag, or the `TRIGGERLINK_DASHBOARD_AUTH` environment variable; if neither is set, the startup logs print a one-time random credential (suitable for intranet/local use only).
 - Four pages: **Run list** (filter by function/status), **Run detail** (step timeline with each step's output/error/retry count), **Event stream** (payloads with backlinks to the runs they triggered), **Function list** (24h success rate).
 - Data refreshes automatically (2–5s polling); the detail page stops polling once a run reaches a terminal state.
+- **Cancelling a run**: the run detail page shows a **Stop run** button while the run is Queued/Running (e.g. stuck retrying against a failing app). Cancelling marks the run `Cancelled` (a terminal state), drops its pending queue items, and discards any in-flight callback result — no further retries or steps will execute.
 
-The corresponding read-only admin API (also protected by basic auth, usable from scripts):
+The corresponding admin API (also protected by basic auth, usable from scripts):
 
 ```bash
 curl -u user:password localhost:8288/api/v1/runs?status=running
 curl -u user:password localhost:8288/api/v1/runs/<run_id>
 curl -u user:password localhost:8288/api/v1/events
 curl -u user:password localhost:8288/api/v1/functions
+# The single write endpoint: cancel a non-terminal run (409 if already terminal)
+curl -u user:password -X POST localhost:8288/api/v1/runs/<run_id>/cancel
 ```
 
 ## 5. Integrating into Your Application (Application Side)
