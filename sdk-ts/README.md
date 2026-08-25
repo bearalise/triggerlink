@@ -130,6 +130,29 @@ Notes:
   turns, tool results), each element carrying `role`/`content` — same field name and shape as
   AgentKit's `result.output`, so helpers like `findLastIndex((m) => m.role === "assistant")`
   port directly. `lastAssistantTextMessageContent(result)` is the built-in shortcut.
+- **`lifecycle.onResponse`**: fired once per *actual* LLM call (inside the durable step, after
+  redaction) with `{ result, iteration }`; `result` is an `AgentIterationResult`
+  (`{ text, output, toolCalls, usage }` for that iteration) and works directly with
+  `lastAssistantTextMessageContent(result)`. Memo-hit replays do not re-fire it, so hook side
+  effects run exactly once per LLM call; a throwing hook fails the step (platform retries).
+  There is no `network.state` — because function code is the router, extract results after
+  `agent.run` returns (via `result.output` / `result.toolCalls`), or write to your own storage
+  inside the hook (closure variables don't survive platform re-invocations):
+
+  ```ts
+  const codeAgent = createAgent({
+    name: "code-agent",
+    model: openai("gpt-4.1"),
+    lifecycle: {
+      onResponse: async ({ result }) => {
+        const lastAssistantText = lastAssistantTextMessageContent(result);
+        if (lastAssistantText?.includes("<task_summary>")) {
+          await db.runs.update(runId, { summary: lastAssistantText }); // your own storage
+        }
+      },
+    },
+  });
+  ```
 - **`redact` hook** (optional): transforms each step's output inside `step.run` before
   persistence, e.g. to strip secrets or PII from memos. It must be deterministic and
   replay-safe — the memo is what the model sees of its own prior turns after a crash-resume:

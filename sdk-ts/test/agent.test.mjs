@@ -321,3 +321,79 @@ test("内置 provider：anthropic/openai/deepseek 开箱构造 LanguageModel", a
   const custom = createDeepSeek({ apiKey: "k", baseURL: "https://example.com/v1" });
   assert.equal(custom("deepseek-chat").modelId, "deepseek-chat");
 });
+
+test("lifecycle.onResponse:每次真实 LLM 调用触发一次,result 形状正确", async () => {
+  const model = new MockLanguageModelV4({
+    doGenerate: [
+      toolCallsResult([{ id: "c1", name: "search", input: { query: "x" } }]),
+      textResult("final answer", 20, 8),
+    ],
+  });
+  const seen = [];
+  const agent = createAgent({
+    name: "lc1",
+    model,
+    tools: { search: searchTool(() => "r") },
+    lifecycle: {
+      onResponse: ({ result, iteration }) => {
+        seen.push({ iteration, text: result.text, viaHelper: lastAssistantTextMessageContent(result) });
+      },
+    },
+  });
+
+  const { result } = await drive(agent, "q");
+  assert.equal(result.text, "final answer");
+  assert.equal(seen.length, 2);
+  // 第一轮:text 为空、有 tool call;helper 能消费 result.output
+  assert.equal(seen[0].iteration, 0);
+  assert.equal(seen[0].viaHelper, ""); // tool-call-only 轮次 text 为空串
+  // 第二轮:最终文本
+  assert.equal(seen[1].iteration, 1);
+  assert.equal(seen[1].text, "final answer");
+  assert.equal(seen[1].viaHelper, "final answer");
+});
+
+test("lifecycle.onResponse:memo 命中的恢复重放不触发", async () => {
+  const hash = (stepId, seq) =>
+    createHash("sha256").update(`${FN_ID}:${stepId}:${seq}`).digest("hex");
+  const preseeded = {
+    [hash("agent/lc2/llm", 0)]: {
+      id: "agent/lc2/llm",
+      status: "completed",
+      output: {
+        text: "",
+        toolCalls: [{ toolCallId: "c1", toolName: "search", input: { query: "x" } }],
+        responseMessages: [
+          { role: "assistant", content: [{ type: "tool-call", toolCallId: "c1", toolName: "search", input: { query: "x" } }] },
+        ],
+        usage: { inputTokens: 10, outputTokens: 5 },
+      },
+    },
+    [hash("agent/lc2/tool", 0)]: { id: "agent/lc2/tool", status: "completed", output: "r" },
+  };
+  let fired = 0;
+  const model = new MockLanguageModelV4({ doGenerate: textResult("done") });
+  const agent = createAgent({
+    name: "lc2",
+    model,
+    tools: { search: searchTool(() => "r") },
+    lifecycle: { onResponse: () => fired++ },
+  });
+
+  await drive(agent, "q", preseeded);
+  assert.equal(fired, 1); // 只有第二次真实 LLM 调用触发;第一轮 memo 命中不触发
+});
+
+test("lifecycle.onResponse 抛错:视同 step 失败", async () => {
+  const model = new MockLanguageModelV4({ doGenerate: textResult("x") });
+  const agent = createAgent({
+    name: "lc3",
+    model,
+    lifecycle: {
+      onResponse: () => {
+        throw new Error("hook boom");
+      },
+    },
+  });
+  await assert.rejects(drive(agent, "q"), /StepError: hook boom/);
+});

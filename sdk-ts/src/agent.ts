@@ -66,6 +66,28 @@ export interface RedactCtx {
  */
 export type RedactHook = (output: unknown, ctx: RedactCtx) => unknown;
 
+/** 单轮 LLM 调用的结果（lifecycle.onResponse 的入参）。 */
+export interface AgentIterationResult {
+  /** 本轮 assistant 文本 */
+  text: string;
+  /** 本轮 assistant 消息（与 lastAssistantTextMessageContent 兼容） */
+  output: TextMessage[];
+  /** 本轮模型发起的工具调用（尚未执行） */
+  toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }>;
+  usage: { inputTokens?: number; outputTokens?: number };
+}
+
+export interface AgentLifecycle {
+  /**
+   * 每次 LLM 调用真实执行后触发一次（memo 命中/恢复重放不触发），
+   * 看到的是 redact 之后的最终内容（与落库 memo、模型历史一致）。
+   * 抛错视同 step 失败：StepError → 平台退避重试（LLM 会被重新调用）。
+   * 注意：函数会被平台反复重入，闭包变量不可靠；要保留 hook 产出请写自己的存储，
+   * 或在 agent.run 返回后从 AgentResult 收尾提取。
+   */
+  onResponse?: (args: { result: AgentIterationResult; iteration: number }) => void | Promise<void>;
+}
+
 export interface AgentOpts {
   /** 稳定标识，用作 memo 键前缀（agent/<name>/...）；同一函数内不同 Agent 必须不同名（§5.2） */
   name: string;
@@ -77,6 +99,7 @@ export interface AgentOpts {
   /** 迭代上限（一次迭代 = 一次 LLM 调用 + 其全部工具执行），默认 10；超限抛错使 run 失败 */
   maxIterations?: number;
   redact?: RedactHook;
+  lifecycle?: AgentLifecycle;
 }
 
 export interface AgentResult {
@@ -227,6 +250,17 @@ export function createAgent(opts: AgentOpts): Agent {
           };
           const out = redact ? redact(memo, { kind: "llm", iteration: i }) : memo;
           assertLlmMemoShape(out, agent.name); // 落库前拦截坏结构
+          // onResponse 在 step 回调内触发：只在 LLM 真实执行时跑一次，
+          // memo 命中/恢复重放不重复触发；抛错视同 step 失败走重试。
+          await opts.lifecycle?.onResponse?.({
+            result: {
+              text: out.text,
+              output: out.responseMessages,
+              toolCalls: out.toolCalls,
+              usage: out.usage,
+            },
+            iteration: i,
+          });
           return out;
         });
         assertLlmMemoShape(llmMemo, agent.name); // memo 命中路径同样校验（防御脏数据）

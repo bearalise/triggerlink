@@ -90,6 +90,13 @@ interface AgentOpts {
   tools?: Record<string, AgentTool>;
   maxIterations?: number;              // default 10; throws (RunError) when exceeded
   redact?: RedactHook;                 // opt-in; transforms step output before persistence (see §5.7)
+  lifecycle?: {
+    // fired once per *actual* LLM call, inside the llm step (after redact+validate):
+    // memo-hit replays never re-fire it (hook side effects are exactly-once-per-LLM-call);
+    // a throwing hook fails the step → platform retry. result.output is the iteration's
+    // assistant messages, so lastAssistantTextMessageContent(result) works directly.
+    onResponse?: (args: { result: AgentIterationResult; iteration: number }) => void | Promise<void>;
+  };
 }
 
 interface RedactCtx {
