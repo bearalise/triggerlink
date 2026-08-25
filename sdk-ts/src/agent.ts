@@ -5,13 +5,22 @@
 import {
   generateText,
   tool,
+  type AssistantModelMessage,
   type JSONValue,
   type LanguageModel,
   type ModelMessage,
+  type ToolModelMessage,
   type ToolSet,
+  type UserModelMessage,
 } from "ai";
 import type { ZodType } from "zod";
 import type { StepTool } from "./step.js";
+
+/**
+ * 对话消息：user / assistant / tool 三种（不含 system——system prompt 走
+ * AgentOpts.system 参数，不进消息列表）。AgentResult.output 的元素类型。
+ */
+export type TextMessage = UserModelMessage | AssistantModelMessage | ToolModelMessage;
 
 // 内置 provider，开箱即用：默认实例从环境变量读 API key
 // （ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY）；
@@ -88,7 +97,7 @@ export interface AgentResult {
    * 的 result.output 对齐——可自行 findLastIndex 等遍历（元素含 role/content）。
    * 恢复重放时由 memo 原样重建；启用 redact 时历史内容即脱敏后内容。
    */
-  output: ModelMessage[];
+  output: TextMessage[];
 }
 
 /** 取最后一条 assistant 消息的文本内容（拼接所有 text part）；没有则返回 undefined。 */
@@ -125,7 +134,7 @@ interface LlmMemo {
   text: string;
   toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }>;
   /** 该迭代的 assistant 消息（含 tool-call parts），恢复时原样喂回模型 */
-  responseMessages: ModelMessage[];
+  responseMessages: TextMessage[];
   usage: { inputTokens?: number; outputTokens?: number };
 }
 
@@ -190,7 +199,7 @@ export function createAgent(opts: AgentOpts): Agent {
       const redact = opts.redact;
       const llmStepId = `agent/${agent.name}/llm`;
       const toolStepId = `agent/${agent.name}/tool`;
-      const messages: ModelMessage[] = [{ role: "user", content: input }];
+      const messages: TextMessage[] = [{ role: "user", content: input }];
       const usage = { inputTokens: 0, outputTokens: 0 };
       const toolCalls: AgentToolCallRecord[] = [];
 
@@ -244,7 +253,7 @@ export function createAgent(opts: AgentOpts): Agent {
           });
           // memo 命中时 step.run 直接返回缓存值,重放路径同样补全记录
           toolCalls.push({ toolCallId: call.toolCallId, toolName: call.toolName, input: call.input, output });
-          const toolMsg: ModelMessage = {
+          const toolMsg: TextMessage = {
             role: "tool",
             content: [
               {

@@ -115,7 +115,9 @@ interface AgentResult {
   // rebuilt from memos. Same field name as AgentKit's result.output, so traversal helpers
   // like findLastIndex(m => m.role === "assistant") port directly; the built-in shortcut
   // is lastAssistantTextMessageContent(result).
-  output: ModelMessage[];
+  // Element type is the SDK-exported TextMessage = user | assistant | tool (no system —
+  // the system prompt lives in AgentOpts.system, never in the message list).
+  output: TextMessage[];
 }
 ```
 
