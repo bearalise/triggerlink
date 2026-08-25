@@ -77,6 +77,21 @@ export interface AgentResult {
   iterations: number;
   /** 各迭代 token 用量合计（memo 命中时也照常累计） */
   usage: { inputTokens: number; outputTokens: number };
+  /**
+   * 本次运行的全部工具执行记录（按执行顺序，含结构化输出）。
+   * 覆盖 AgentKit 的 "done 工具写 state.kv" 模式：函数代码从这里的 output 读取
+   * 工具产出，无需解析最终文本。恢复重放时 memo 命中路径同样重建该列表。
+   */
+  toolCalls: AgentToolCallRecord[];
+}
+
+/** 一次工具执行的记录。 */
+export interface AgentToolCallRecord {
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+  /** 工具的返回值（redact 钩子启用时为脱敏后的值——与模型所见一致） */
+  output: unknown;
 }
 
 export interface Agent {
@@ -156,6 +171,7 @@ export function createAgent(opts: AgentOpts): Agent {
       const toolStepId = `agent/${agent.name}/tool`;
       const messages: ModelMessage[] = [{ role: "user", content: input }];
       const usage = { inputTokens: 0, outputTokens: 0 };
+      const toolCalls: AgentToolCallRecord[] = [];
 
       for (let i = 0; ; i++) {
         if (i >= maxIterations) {
@@ -190,7 +206,7 @@ export function createAgent(opts: AgentOpts): Agent {
         messages.push(...llmMemo.responseMessages);
 
         if (llmMemo.toolCalls.length === 0) {
-          return { text: llmMemo.text, iterations: i + 1, usage };
+          return { text: llmMemo.text, iterations: i + 1, usage, toolCalls };
         }
 
         // 并行 tool call 顺序执行（数组序），每个一个 durable step（§5.3）
@@ -205,6 +221,8 @@ export function createAgent(opts: AgentOpts): Agent {
               ? redact(out, { kind: "tool", iteration: i, toolName: call.toolName })
               : out;
           });
+          // memo 命中时 step.run 直接返回缓存值,重放路径同样补全记录
+          toolCalls.push({ toolCallId: call.toolCallId, toolName: call.toolName, input: call.input, output });
           const toolMsg: ModelMessage = {
             role: "tool",
             content: [

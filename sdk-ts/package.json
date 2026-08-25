@@ -1,6 +1,6 @@
 {
   "name": "@triggerlink/sdk",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "TriggerLink TypeScript SDK: durable, crash-recoverable functions for Next.js / Node.js",
   "keywords": [
     "triggerlink",

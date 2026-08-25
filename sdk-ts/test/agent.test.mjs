@@ -113,6 +113,10 @@ test("工具调用流程：llm → tool → llm，各自 memo 化", async () => 
   assert.equal(result.text, "answer");
   assert.equal(result.iterations, 2);
   assert.deepEqual(result.usage, { inputTokens: 30, outputTokens: 13 });
+  // 工具执行记录:函数代码可直接拿到结构化输出(done 工具模式)
+  assert.deepEqual(result.toolCalls, [
+    { toolCallId: "call_1", toolName: "search", input: { query: "triggerlink" }, output: { hits: 3 } },
+  ]);
   assert.equal(model.doGenerateCalls.length, 2);
 
   // 三个 memo：llm:0、tool:0、llm:1
@@ -247,6 +251,10 @@ test("replay：预置 llm:0/tool:0 memo，恢复只重跑第二次 LLM 调用", 
   const { result } = await drive(agent, "q", preseeded);
   assert.equal(result.text, "resumed answer");
   assert.equal(result.iterations, 2);
+  // 重放路径:memo 命中的工具执行也补全进 toolCalls 记录
+  assert.deepEqual(result.toolCalls, [
+    { toolCallId: "c1", toolName: "search", input: { query: "x" }, output: { hits: 3 } },
+  ]);
   // 模型只被调一次（第二次 llm step）；第一次命中 memo
   assert.equal(model.doGenerateCalls.length, 1);
   // 恢复重建的历史里包含 memo 中的 assistant tool-call 与 tool 结果

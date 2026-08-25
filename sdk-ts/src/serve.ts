@@ -7,7 +7,7 @@ import { ExecCtx, StepInterrupt, type Opcode, type StepState } from "./execx.js"
 import { createStepTool, errMessage } from "./step.js";
 import { verifySignature } from "./sign.js";
 
-export const sdkVersion = "triggerlink-ts/0.4.2";
+export const sdkVersion = "triggerlink-ts/0.4.3";
 export const SIGNATURE_HEADER = "x-triggerlink-signature";
 
 const MAX_BODY = 10 << 20; // 10 MB，与平台一致

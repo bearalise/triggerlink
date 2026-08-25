@@ -122,6 +122,10 @@ Notes:
   *L + T* platform callbacks (one per step). Each step appears in the dashboard run detail
   with its output — per-call tracing and token usage for free.
 - **Multi-tool responses** are executed sequentially in array order, one step each.
+- **Structured tool outputs**: `AgentResult.toolCalls` lists every tool execution of the run
+  (`{ toolCallId, toolName, input, output }`, in order; rebuilt from memos on recovery).
+  This covers the "done tool writes to shared state" pattern from agent frameworks like
+  AgentKit — read the tool's output here instead of parsing the final text.
 - **`redact` hook** (optional): transforms each step's output inside `step.run` before
   persistence, e.g. to strip secrets or PII from memos. It must be deterministic and
   replay-safe — the memo is what the model sees of its own prior turns after a crash-resume:

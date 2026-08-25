@@ -108,6 +108,9 @@ interface AgentResult {
   text: string;                        // final assistant message
   iterations: number;
   usage: { inputTokens: number; outputTokens: number };  // summed across iterations
+  // every tool execution of the run, in order; rebuilt from memos on recovery.
+  // Function code reads structured tool outputs here (no shared-state abstraction needed).
+  toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown; output: unknown }>;
 }
 ```
 
