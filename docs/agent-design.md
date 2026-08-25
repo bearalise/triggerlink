@@ -111,6 +111,11 @@ interface AgentResult {
   // every tool execution of the run, in order; rebuilt from memos on recovery.
   // Function code reads structured tool outputs here (no shared-state abstraction needed).
   toolCalls: Array<{ toolCallId: string; toolName: string; input: unknown; output: unknown }>;
+  // full conversation history (user + assistant + tool messages, each with role/content);
+  // rebuilt from memos. Same field name as AgentKit's result.output, so traversal helpers
+  // like findLastIndex(m => m.role === "assistant") port directly; the built-in shortcut
+  // is lastAssistantTextMessageContent(result).
+  output: ModelMessage[];
 }
 ```
 

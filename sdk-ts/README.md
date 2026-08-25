@@ -126,6 +126,10 @@ Notes:
   (`{ toolCallId, toolName, input, output }`, in order; rebuilt from memos on recovery).
   This covers the "done tool writes to shared state" pattern from agent frameworks like
   AgentKit — read the tool's output here instead of parsing the final text.
+- **Message history**: `AgentResult.output` is the full conversation (user input, assistant
+  turns, tool results), each element carrying `role`/`content` — same field name and shape as
+  AgentKit's `result.output`, so helpers like `findLastIndex((m) => m.role === "assistant")`
+  port directly. `lastAssistantTextMessageContent(result)` is the built-in shortcut.
 - **`redact` hook** (optional): transforms each step's output inside `step.run` before
   persistence, e.g. to strip secrets or PII from memos. It must be deterministic and
   replay-safe — the memo is what the model sees of its own prior turns after a crash-resume:

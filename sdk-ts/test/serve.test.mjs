@@ -39,7 +39,7 @@ test("GET manifest: 未签名 401，签名后返回函数清单", async () => {
   const ok = await GET(new Request("http://localhost/api/triggerlink", { headers: signedHeaders() }));
   assert.equal(ok.status, 200);
   const manifest = await ok.json();
-  assert.equal(manifest.sdk, "triggerlink-ts/0.4.3");
+  assert.equal(manifest.sdk, "triggerlink-ts/0.4.4");
   assert.equal(manifest.app_id, "web");
   assert.deepEqual(manifest.functions, [{ id: "process-doc", event: "doc/uploaded", retries: 4 }]);
 });

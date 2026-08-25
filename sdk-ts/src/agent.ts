@@ -83,6 +83,27 @@ export interface AgentResult {
    * 工具产出，无需解析最终文本。恢复重放时 memo 命中路径同样重建该列表。
    */
   toolCalls: AgentToolCallRecord[];
+  /**
+   * 完整对话历史（user 输入 + 各轮 assistant 消息 + 工具结果），字段名与 AgentKit
+   * 的 result.output 对齐——可自行 findLastIndex 等遍历（元素含 role/content）。
+   * 恢复重放时由 memo 原样重建；启用 redact 时历史内容即脱敏后内容。
+   */
+  output: ModelMessage[];
+}
+
+/** 取最后一条 assistant 消息的文本内容（拼接所有 text part）；没有则返回 undefined。 */
+export function lastAssistantTextMessageContent(result: AgentResult): string | undefined {
+  // 不用 findLast:tsconfig lib 为 ES2022
+  for (let i = result.output.length - 1; i >= 0; i--) {
+    const msg = result.output[i];
+    if (msg.role !== "assistant") continue;
+    if (typeof msg.content === "string") return msg.content;
+    return msg.content
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("");
+  }
+  return undefined;
 }
 
 /** 一次工具执行的记录。 */
@@ -206,7 +227,7 @@ export function createAgent(opts: AgentOpts): Agent {
         messages.push(...llmMemo.responseMessages);
 
         if (llmMemo.toolCalls.length === 0) {
-          return { text: llmMemo.text, iterations: i + 1, usage, toolCalls };
+          return { text: llmMemo.text, iterations: i + 1, usage, toolCalls, output: messages };
         }
 
         // 并行 tool call 顺序执行（数组序），每个一个 durable step（§5.3）

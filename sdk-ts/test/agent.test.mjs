@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { MockLanguageModelV4 } from "ai/test";
 import { z } from "zod";
-import { createAgent, createTool } from "../dist/agent.js";
+import { createAgent, createTool, lastAssistantTextMessageContent } from "../dist/agent.js";
 import { StepInterrupt } from "../dist/execx.js";
 import { ExecCtx } from "../dist/execx.js";
 import { createStepTool } from "../dist/step.js";
@@ -117,6 +117,10 @@ test("工具调用流程：llm → tool → llm，各自 memo 化", async () => 
   assert.deepEqual(result.toolCalls, [
     { toolCallId: "call_1", toolName: "search", input: { query: "triggerlink" }, output: { hits: 3 } },
   ]);
+  // 完整消息历史(result.output,与 AgentKit 对齐):user → assistant(tool-call) → tool(result) → assistant(text)
+  assert.deepEqual(result.output.map((m) => m.role), ["user", "assistant", "tool", "assistant"]);
+  assert.equal(result.output.findLastIndex((m) => m.role === "assistant"), 3);
+  assert.equal(lastAssistantTextMessageContent(result), "answer");
   assert.equal(model.doGenerateCalls.length, 2);
 
   // 三个 memo：llm:0、tool:0、llm:1
