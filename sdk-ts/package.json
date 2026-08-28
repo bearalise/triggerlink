@@ -59,7 +59,7 @@
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.39",
-    "@ai-sdk/deepseek": "^3.0.28",
+    "@ai-sdk/deepseek": "^3.0.32",
     "@ai-sdk/openai": "^4.0.42",
     "ai": "^7.0.66"
   }

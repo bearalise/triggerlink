@@ -316,10 +316,10 @@ test("内置 provider：anthropic/openai/deepseek 开箱构造 LanguageModel", a
   assert.equal(a.provider, "anthropic.messages");
   assert.equal(a.modelId, "claude-sonnet-4-5");
   assert.equal(openai("gpt-4o").provider, "openai.responses");
-  assert.equal(deepseek("deepseek-chat").provider, "deepseek.chat");
+  assert.equal(deepseek("deepseek-v4-flash").provider, "deepseek.chat");
   // createXxx 支持自定义配置（如 baseURL / apiKey）
   const custom = createDeepSeek({ apiKey: "k", baseURL: "https://example.com/v1" });
-  assert.equal(custom("deepseek-chat").modelId, "deepseek-chat");
+  assert.equal(custom("deepseek-v4-flash").modelId, "deepseek-v4-flash");
 });
 
 test("lifecycle.onResponse:每次真实 LLM 调用触发一次,result 形状正确", async () => {
