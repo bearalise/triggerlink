@@ -310,16 +310,19 @@ test("createTool：工厂定义的工具与字面量等价，且可跨 Agent 复
   assert.deepEqual(toolMsg.content[0].output, { type: "json", value: "result:x" });
 });
 
-test("内置 provider：anthropic/openai/deepseek 开箱构造 LanguageModel", async () => {
-  const { anthropic, openai, deepseek, createDeepSeek } = await import("../dist/agent.js");
+test("内置 provider：anthropic/openai/deepseek/zai 开箱构造 LanguageModel", async () => {
+  const { anthropic, openai, deepseek, createDeepSeek, zai, createZhipu } = await import("../dist/agent.js");
   const a = anthropic("claude-sonnet-4-5");
   assert.equal(a.provider, "anthropic.messages");
   assert.equal(a.modelId, "claude-sonnet-4-5");
   assert.equal(openai("gpt-4o").provider, "openai.responses");
   assert.equal(deepseek("deepseek-v4-flash").provider, "deepseek.chat");
+  assert.equal(zai("glm-5").provider, "zhipu.chat");
   // createXxx 支持自定义配置（如 baseURL / apiKey）
   const custom = createDeepSeek({ apiKey: "k", baseURL: "https://example.com/v1" });
   assert.equal(custom("deepseek-v4-flash").modelId, "deepseek-v4-flash");
+  const customZai = createZhipu({ apiKey: "k", baseURL: "https://api.z.ai/api/paas/v4" });
+  assert.equal(customZai("glm-5").modelId, "glm-5");
 });
 
 test("lifecycle.onResponse:每次真实 LLM 调用触发一次,result 形状正确", async () => {

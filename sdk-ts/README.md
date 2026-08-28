@@ -81,9 +81,9 @@ import { createFunction } from "@triggerlink/sdk";
 import { createAgent, createTool, anthropic } from "@triggerlink/sdk/agent";   // subpath import, not the main entry
 import { z } from "zod";
 
-// Built-in providers, zero extra installs: anthropic / openai / deepseek
-// (plus createAnthropic / createOpenAI / createDeepSeek for custom baseURL/apiKey).
-// Default instances read ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY from the env.
+// Built-in providers, zero extra installs: anthropic / openai / deepseek / zai
+// (plus createAnthropic / createOpenAI / createDeepSeek / createZhipu for custom baseURL/apiKey).
+// Default instances read ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY / ZHIPU_API_KEY from the env.
 // Any other AI SDK LanguageModel can still be passed as `model` directly.
 
 // createTool is a generic factory: the zod schema's type flows into the handler's

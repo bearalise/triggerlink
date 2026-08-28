@@ -1,6 +1,6 @@
 {
   "name": "@triggerlink/sdk",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "TriggerLink TypeScript SDK: durable, crash-recoverable functions for Next.js / Node.js",
   "keywords": [
     "triggerlink",
@@ -61,6 +61,7 @@
     "@ai-sdk/anthropic": "^4.0.39",
     "@ai-sdk/deepseek": "^3.0.32",
     "@ai-sdk/openai": "^4.0.42",
-    "ai": "^7.0.66"
+    "ai": "^7.0.66",
+    "zhipu-ai-provider": "^0.4.0"
   }
 }
