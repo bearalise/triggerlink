@@ -164,6 +164,8 @@ type Store interface {
 
 	Enqueue(ctx context.Context, item QueueItem) error
 	LeaseBatch(ctx context.Context, now time.Time, leaseDur time.Duration, limit int) ([]QueueItem, error)
+	QueueDepth(ctx context.Context) (int, error)
+	ActiveWaitCount(ctx context.Context) (int, error)
 	ReleaseLease(ctx context.Context, id string, retryAt time.Time) error
 	CompleteQueueItem(ctx context.Context, id string) error
 	RequeueExpiredLeases(ctx context.Context, now time.Time) (int, error)
@@ -731,6 +733,24 @@ func (s *SQLiteStore) ReleaseLease(ctx context.Context, id string, retryAt time.
 }
 
 // CompleteQueueItem 删除已完成的队列项。
+// QueueDepth 返回已到点的待执行队列项数（status=pending 且 at<=now），即积压深度。
+// 未到点的延迟项（sleep 唤醒、退避重试）不计入：它们不是"等待被执行"的积压。
+func (s *SQLiteStore) QueueDepth(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM queue_items WHERE status=? AND at<=?`,
+		QueuePending, fmtTime(time.Now())).Scan(&n)
+	return n, err
+}
+
+// ActiveWaitCount 返回处于 waiting 状态的 step.waitForEvent 挂起数。
+func (s *SQLiteStore) ActiveWaitCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM waits WHERE status=?`, WaitWaiting).Scan(&n)
+	return n, err
+}
+
 func (s *SQLiteStore) CompleteQueueItem(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM queue_items WHERE id=?`, id)
 	return err

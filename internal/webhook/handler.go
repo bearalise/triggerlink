@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/sign"
 	"github.com/bearalise/triggerlink/internal/store"
 )
@@ -94,5 +95,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if inserted {
 		h.stream <- e
 	}
+	metrics.EventReceived(1)
 	writeJSON(w, http.StatusOK, map[string]any{"id": e.ID})
 }

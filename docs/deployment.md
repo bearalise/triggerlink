@@ -97,6 +97,32 @@ See the "Deploying the Platform" section of the [User Guide](user-guide.md) for 
 - Logs are structured key/value lines (Go `log/slog` text handler) on stderr; under systemd they land in journald as-is (`journalctl -u triggerlink`).
 - `-log-level debug|info|warn|error` (default `info`, or env `TRIGGERLINK_LOG_LEVEL`) controls verbosity. `debug` adds per-event routing, callback durations, and step suspend/resume lines — useful when tracing a single run, noisy under load.
 
+### Metrics (`/metrics`)
+
+`GET /metrics` exposes Prometheus text format. The endpoint is **public** (no basic auth), following scrape convention — on a public deployment, restrict it at the reverse proxy.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `triggerlink_events_received_total` | counter | Events accepted at an ingress (Event API + webhook endpoints), duplicates included |
+| `triggerlink_events_routed_total{result}` | counter | Routing decisions per (event, subscribing function); `result` = `routed` / `paused` / `filtered` (trigger `match` missed) / `no_subscriber` (counted once per unsubscribed event) |
+| `triggerlink_runs_total{status}` | counter | Runs that reached a terminal state; `status` = `completed` / `failed` / `cancelled` / `timeout` |
+| `triggerlink_run_duration_seconds` | histogram | Run creation → terminal state, durable sleeps and waits included |
+| `triggerlink_step_duration_seconds{op}` | histogram | `Run` / `SendEvent` = in-callback execution time; `Sleep` = requested sleep length; `WaitForEvent` = wall-clock until resolved |
+| `triggerlink_callback_duration_seconds` | histogram | Platform→app callback round trip, one per run hop |
+| `triggerlink_queue_depth` | gauge | Pending queue items already due (`at <= now`) |
+| `triggerlink_waits_active` | gauge | `step.waitForEvent` suspensions still waiting |
+
+The two gauges are refreshed by a 10s sampler rather than on scrape, so scrape frequency never drives database load. Go runtime and process collectors are registered alongside (`go_*`, `process_*`).
+
+Minimal scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: triggerlink
+    static_configs:
+      - targets: ["triggerlink-host:8288"]
+```
+
 ### Dashboard Authentication
 
 - `-dashboard-auth user:password` (or env `TRIGGERLINK_DASHBOARD_AUTH`): protects `/dashboard` and the read-only `/api/v1/{events,functions,runs}` endpoints.

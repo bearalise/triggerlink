@@ -22,6 +22,7 @@ import (
 	"github.com/bearalise/triggerlink/internal/eventapi"
 	"github.com/bearalise/triggerlink/internal/executor"
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/runner"
 	"github.com/bearalise/triggerlink/internal/scheduler"
@@ -31,6 +32,9 @@ import (
 
 // version 由 goreleaser 通过 -ldflags "-X main.version=..." 注入；本地构建为 dev。
 var version = "dev"
+
+// metricsSampleInterval 是 queue_depth / waits_active 两个 gauge 的采样周期。
+const metricsSampleInterval = 10 * time.Second
 
 type stringSlice []string
 
@@ -175,6 +179,8 @@ func main() {
 			slog.Error("scheduler exited", "err", err)
 		}
 	}()
+	// 队列深度 / 活跃 wait 数按固定周期采样（不挂在 /metrics 抓取路径上，FR-6.4）。
+	go metrics.StartSampler(ctx, st, metricsSampleInterval)
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/events", eventapi.NewHandler(st, eventKey, stream))
@@ -193,6 +199,8 @@ func main() {
 	mux.Handle("/api/v1/webhooks/", secure(dash))
 	// webhook 接收端点：公开路径（不套 basic auth），安全完全依赖 HMAC 验签（FR-3.4）
 	mux.Handle("/hooks/", webhook.NewHandler(st, stream))
+	// Prometheus 抓取端点：按惯例公开（不套 basic auth）；公网部署应在反代层限制来源。
+	mux.Handle("/metrics", metrics.Handler())
 	mux.Handle("/dashboard/", secure(dashboard.Handler()))
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {

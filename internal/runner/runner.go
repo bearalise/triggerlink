@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/store"
 )
@@ -63,16 +64,22 @@ func (r *Runner) Run(ctx context.Context) error {
 
 func (r *Runner) route(ctx context.Context, e store.Event) error {
 	routed := 0
-	for _, f := range r.Reg.Match(e.Name) {
+	subscribers := r.Reg.Match(e.Name)
+	if len(subscribers) == 0 {
+		metrics.EventRouted(metrics.ResultNoSubscriber)
+	}
+	for _, f := range subscribers {
 		// 暂停的函数不接新触发（FR-7.3）：跳过建 run；事件仍照常标记 routed。
 		// 查询失败时 fail-open（不跳过），避免存储抖动导致触发丢失。
 		if paused, err := r.Store.IsFunctionPaused(ctx, f.ID); err != nil {
 			slog.Warn("check paused failed", "component", "runner", "function_id", f.ID, "err", err)
 		} else if paused {
+			metrics.EventRouted(metrics.ResultPaused)
 			continue
 		}
 		// 事件触发 match（FR-3.1）：非空且不命中（含编译/求值失败）则不为该函数建 run。
 		if !evalTriggerMatch(f.Match, e) {
+			metrics.EventRouted(metrics.ResultFiltered)
 			continue
 		}
 		// run ID 由 (event_id, function_id) 确定性派生：对账扫描与 stream 消费重叠导致
@@ -94,6 +101,7 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 			continue
 		}
 		routed++
+		metrics.EventRouted(metrics.ResultRouted)
 		// 延迟事件（FR-1.6）：ts 为未来时间时，到点前不出队触发。
 		at := time.Now()
 		if e.TS.After(at) {
@@ -153,6 +161,7 @@ func (r *Runner) resumeWaits(ctx context.Context, e store.Event) error {
 			slog.Error("resume wait failed", "component", "runner", "wait_id", w.ID, "run_id", w.RunID, "err", err)
 			continue
 		}
+		metrics.StepObserved("WaitForEvent", time.Since(w.CreatedAt))
 		r.enqueueResume(ctx, run)
 		slog.Info("run resumed by event", "component", "runner", "run_id", run.ID, "function_id", run.FunctionID, "event_id", e.ID, "wait_id", w.ID)
 	}
@@ -186,6 +195,7 @@ func (r *Runner) scanWaitTimeouts(ctx context.Context) {
 			slog.Error("timeout wait failed", "component", "runner", "wait_id", w.ID, "run_id", w.RunID, "err", err)
 			continue
 		}
+		metrics.StepObserved("WaitForEvent", time.Since(w.CreatedAt))
 		r.enqueueResume(ctx, run)
 		slog.Info("wait timed out", "component", "runner", "run_id", run.ID, "function_id", run.FunctionID, "wait_id", w.ID)
 	}
@@ -207,6 +217,7 @@ func (r *Runner) applyCancelOn(ctx context.Context, e store.Event) error {
 					continue
 				}
 				if cancelled {
+					metrics.RunFinished(metrics.StatusCancelled, time.Since(run.CreatedAt))
 					r.Store.CancelWaitsForRun(ctx, run.ID)
 					slog.Info("run cancelled by cancel_on", "component", "runner", "run_id", run.ID, "function_id", run.FunctionID, "event_id", e.ID)
 				}

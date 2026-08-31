@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/sign"
 	"github.com/bearalise/triggerlink/internal/store"
@@ -245,6 +246,8 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		return
 	}
 	defer resp.Body.Close()
+	callbackDur := time.Since(started)
+	metrics.CallbackObserved(callbackDur)
 	slog.Debug("callback returned", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID,
 		"attempt", attempt, "status", resp.StatusCode, "duration", time.Since(started))
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
@@ -270,6 +273,7 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 
 	switch op.Op {
 	case "StepComplete":
+		metrics.StepObserved("Run", callbackDur)
 		e.Store.SaveStepResult(ctx, store.StepResult{
 			RunID: run.ID, StepHash: op.ID, StepID: op.StepID, Op: "Run",
 			Status: store.StepCompleted, Output: op.Output, Attempt: attempt})
@@ -291,14 +295,16 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.Store.SaveStepResult(ctx, store.StepResult{
 			RunID: run.ID, StepHash: op.ID, StepID: op.StepID, Op: "Sleep",
 			Status: store.StepSleeping, Attempt: attempt})
+		metrics.StepObserved("Sleep", time.Until(op.Until))
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		e.enqueueNext(ctx, run, op.Until)
 		slog.Debug("run sleeping", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "step_id", op.StepID, "until", op.Until.Format(time.RFC3339))
 	case "SendEvent":
-		e.handleSendEvent(ctx, item, run, attempt, maxAttempts, op)
+		e.handleSendEvent(ctx, item, run, attempt, maxAttempts, op, callbackDur)
 	case "WaitForEvent":
 		e.handleWaitForEvent(ctx, item, run, attempt, maxAttempts, op)
 	case "RunComplete":
+		metrics.RunFinished(metrics.StatusCompleted, time.Since(run.CreatedAt))
 		e.Store.CompleteRun(ctx, run.ID, op.Output)
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		slog.Info("run completed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID,
@@ -314,7 +320,7 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 // 顺序承诺同 eventapi：先 InsertEvent 落库成功 → 再推入 stream → 写 memo → 推进下一跳。
 // 缺省事件 ID 按 (run_id, step_hash, 序号) 确定性派生：崩溃窗口内重试同一 step 时
 // 重发同 ID 事件，由 InsertEvent 幂等去重，不会重复扇出。
-func (e *Executor) handleSendEvent(ctx context.Context, item store.QueueItem, run store.Run, attempt, maxAttempts int, op opcode) {
+func (e *Executor) handleSendEvent(ctx context.Context, item store.QueueItem, run store.Run, attempt, maxAttempts int, op opcode, callbackDur time.Duration) {
 	if len(op.Events) == 0 {
 		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "send_event: no events")
 		return
@@ -345,6 +351,7 @@ func (e *Executor) handleSendEvent(ctx context.Context, item store.QueueItem, ru
 		}
 		idsOut = append(idsOut, in.ID)
 	}
+	metrics.StepObserved("SendEvent", callbackDur)
 	out, _ := json.Marshal(idsOut)
 	e.Store.SaveStepResult(ctx, store.StepResult{
 		RunID: run.ID, StepHash: op.ID, StepID: op.StepID, Op: "SendEvent",
@@ -418,6 +425,7 @@ func (e *Executor) scanRunTimeouts(ctx context.Context) {
 				continue
 			}
 			if transitioned {
+				metrics.RunFinished(metrics.StatusTimeout, time.Since(run.CreatedAt))
 				e.emitRunFailed(ctx, run, msg)
 				slog.Warn("run timed out", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "timeout", fn.Timeout, "duration", time.Since(run.CreatedAt))
 			}
@@ -445,6 +453,7 @@ func (e *Executor) failRun(ctx context.Context, run store.Run, errMsg string) {
 		slog.Error("fail run failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 		return
 	}
+	metrics.RunFinished(metrics.StatusFailed, time.Since(run.CreatedAt))
 	e.emitRunFailed(ctx, run, errMsg)
 }
 
