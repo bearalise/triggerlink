@@ -22,6 +22,7 @@ import (
 	"github.com/bearalise/triggerlink/internal/ids"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/runner"
+	"github.com/bearalise/triggerlink/internal/scheduler"
 	"github.com/bearalise/triggerlink/internal/store"
 )
 
@@ -95,7 +96,7 @@ func main() {
 				b, _ := json.Marshal(f.CancelOn)
 				cancelOn = string(b)
 			}
-			rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Retries: f.Retries, CancelOn: cancelOn})
+			rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Match: f.Match, Cron: f.Cron, Retries: f.Retries, CancelOn: cancelOn})
 		}
 		return st.ReplaceAppFunctions(ctx, appURL, rfns)
 	}
@@ -111,7 +112,7 @@ func main() {
 				}
 			}
 			byApp[rf.AppURL] = append(byApp[rf.AppURL],
-				registry.Function{ID: rf.ID, Event: rf.Event, Retries: rf.Retries, CancelOn: cancelOn, AppURL: rf.AppURL})
+				registry.Function{ID: rf.ID, Event: rf.Event, Match: rf.Match, Cron: rf.Cron, Retries: rf.Retries, CancelOn: cancelOn, AppURL: rf.AppURL})
 		}
 		for appURL, fns := range byApp {
 			reg.Sync(appURL, fns)
@@ -141,6 +142,7 @@ func main() {
 	stream := make(chan store.Event, 1024)
 	rnr := &runner.Runner{Store: st, Reg: reg, Stream: stream}
 	exec := &executor.Executor{Store: st, Reg: reg, SigningKey: signingKey, Stream: stream}
+	sched := &scheduler.Scheduler{Store: st, Reg: reg}
 	go func() {
 		if err := rnr.Run(ctx); err != nil {
 			log.Printf("runner exited: %v", err)
@@ -149,6 +151,11 @@ func main() {
 	go func() {
 		if err := exec.Run(ctx); err != nil {
 			log.Printf("executor exited: %v", err)
+		}
+	}()
+	go func() {
+		if err := sched.Run(ctx); err != nil {
+			log.Printf("scheduler exited: %v", err)
 		}
 	}()
 

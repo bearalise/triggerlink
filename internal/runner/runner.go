@@ -5,6 +5,8 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"time"
@@ -61,8 +63,14 @@ func (r *Runner) Run(ctx context.Context) error {
 
 func (r *Runner) route(ctx context.Context, e store.Event) error {
 	for _, f := range r.Reg.Match(e.Name) {
-		runID := ids.NewID("run")
-		if err := r.Store.CreateRun(ctx, store.Run{
+		// 事件触发 match（FR-3.1）：非空且不命中（含编译/求值失败）则不为该函数建 run。
+		if !evalTriggerMatch(f.Match, e) {
+			continue
+		}
+		// run ID 由 (event_id, function_id) 确定性派生：对账扫描与 stream 消费重叠导致
+		// 同一事件被路由两次时，第二次 CreateRun 幂等落空（created=false），不重复入队执行。
+		runID := derivedRunID(e.ID, f.ID)
+		created, err := r.Store.CreateRun(ctx, store.Run{
 			ID:         runID,
 			FunctionID: f.ID,
 			Status:     store.RunQueued,
@@ -70,8 +78,12 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 			EventName:  e.Name,
 			EventData:  e.Data,
 			EventTS:    e.TS,
-		}); err != nil {
+		})
+		if err != nil {
 			return err
+		}
+		if !created {
+			continue
 		}
 		// 延迟事件（FR-1.6）：ts 为未来时间时，到点前不出队触发。
 		at := time.Now()
@@ -220,4 +232,10 @@ func (r *Runner) enqueueResume(ctx context.Context, run store.Run) {
 
 func isTerminal(status string) bool {
 	return status == store.RunCompleted || status == store.RunFailed || status == store.RunCancelled
+}
+
+// derivedRunID 由 (event_id, function_id) 派生确定性 run ID（双路由幂等的前提）。
+func derivedRunID(eventID, functionID string) string {
+	sum := sha256.Sum256([]byte(eventID + ":" + functionID))
+	return "run_" + hex.EncodeToString(sum[:12])
 }

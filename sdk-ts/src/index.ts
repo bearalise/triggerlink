@@ -16,6 +16,7 @@ export {
   type EventPayload,
   type TriggerLinkEvent,
   type CancelOnRule,
+  type RunFailedEventData,
 } from "./function.js";
 export { serve, sdkVersion, type ServeOptions } from "./serve.js";
 export { StepInterrupt, type Opcode, type StepState, type OutgoingEvent } from "./execx.js";

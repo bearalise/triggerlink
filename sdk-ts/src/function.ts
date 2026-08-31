@@ -28,15 +28,34 @@ export interface HandlerContext<T = unknown> {
   attempt: number;
 }
 
+/** triggerlink/run.failed 内部事件的 data（FR-2.11），即 onFailure handler 的 event.data。 */
+export interface RunFailedEventData {
+  run_id: string;
+  function_id: string;
+  error: string;
+  /** 触发该 run 的原始事件 */
+  event: EventPayload;
+}
+
 export interface FunctionOpts {
   /** 稳定标识，改名会丢历史 memo 关联 */
   id: string;
-  /** 订阅的事件名 */
-  event: string;
+  /** 订阅的事件名；纯 cron 函数可省略（event/cron 至少其一） */
+  event?: string;
+  /** 事件触发 match 表达式（FR-3.1），expr 语法，环境只含 data（= 事件 data） */
+  match?: string;
+  /** 标准 5 字段 cron（分 时 日 月 周），UTC */
+  cron?: string;
   /** 重试上限；0/缺省 = 平台默认（4） */
   retries?: number;
   /** 取消规则，随 manifest 上报为 cancel_on */
   cancelOn?: CancelOnRule[];
+  /**
+   * run 进入 Failed 终态时的处理器（FR-2.11）。serve 时注册隐式函数 <id>/on-failure，
+   * 订阅内部事件 triggerlink/run.failed（match 按 function_id 过滤），handler 内可用全部 step 原语。
+   * onFailure 自身失败不会递归触发。
+   */
+  onFailure?: (ctx: HandlerContext<RunFailedEventData>) => Promise<unknown>;
 }
 
 export interface TriggerFunction<T = unknown> {
@@ -50,6 +69,8 @@ export function createFunction<T = unknown>(
   handler: (ctx: HandlerContext<T>) => Promise<unknown>,
 ): TriggerFunction<T> {
   if (!opts.id) throw new Error("createFunction: id is required");
-  if (!opts.event) throw new Error("createFunction: event is required");
+  if (!opts.event && !opts.cron) {
+    throw new Error("createFunction: event or cron is required"); // 纯 cron 函数无事件订阅
+  }
   return { opts: { retries: 0, ...opts }, handler };
 }

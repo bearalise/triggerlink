@@ -35,7 +35,7 @@ func seed(t *testing.T, st *store.SQLiteStore, reg *registry.Registry) string {
 		t.Fatal(err)
 	}
 	runID := "run_0000000000001bbb"
-	if err := st.CreateRun(ctx, store.Run{
+	if _, err := st.CreateRun(ctx, store.Run{
 		ID: runID, FunctionID: "fn-a", EventID: "evt_0000000000001aaa",
 		EventName: "doc/uploaded", EventData: json.RawMessage(`{"doc_id":"d1"}`), EventTS: time.Now(),
 	}); err != nil {
@@ -210,7 +210,7 @@ func TestMethodAndNotFound(t *testing.T) {
 func TestCancelRunEndpoint(t *testing.T) {
 	h, st, _ := newTestHandler(t)
 	ctx := context.Background()
-	if err := st.CreateRun(ctx, store.Run{
+	if _, err := st.CreateRun(ctx, store.Run{
 		ID: "run_c1", FunctionID: "fn-a", EventID: "evt_c1",
 		EventName: "e/x", EventData: json.RawMessage(`{}`), EventTS: time.Now(),
 	}); err != nil {

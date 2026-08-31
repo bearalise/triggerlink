@@ -97,10 +97,13 @@ type Wait struct {
 // RegisteredFunction 是一条持久化的函数注册记录（PRD FR-5.3 的存储形态）。
 // 以函数 ID 为主键：函数迁移到新 appURL 时 upsert 覆盖旧行，与 Registry.Sync 语义对齐。
 // CancelOn 是 cancelOn 规则（FR-4.9）的 JSON 序列化形态，空串表示无。
+// Match / Cron 分别是事件触发过滤（FR-3.1）与 cron 触发（FR-3.2）表达式，空串表示无。
 type RegisteredFunction struct {
 	ID       string
 	AppURL   string
 	Event    string
+	Match    string
+	Cron     string
 	Retries  int
 	CancelOn string
 }
@@ -121,7 +124,7 @@ type Store interface {
 	MarkEventRouted(ctx context.Context, id string) error
 	UnroutedEvents(ctx context.Context) ([]Event, error)
 
-	CreateRun(ctx context.Context, r Run) error
+	CreateRun(ctx context.Context, r Run) (bool, error)
 	GetRun(ctx context.Context, id string) (Run, error)
 	MarkRunRunning(ctx context.Context, id string) (bool, error)
 	CompleteRun(ctx context.Context, id string, output json.RawMessage) error
@@ -255,7 +258,13 @@ CREATE INDEX IF NOT EXISTS idx_waits_event ON waits(status, event_name);
 	if err := ensureColumn(db, "step_runs", "updated_at", "TEXT"); err != nil {
 		return err
 	}
-	return ensureColumn(db, "functions", "cancel_on", "TEXT")
+	if err := ensureColumn(db, "functions", "cancel_on", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "functions", "match", "TEXT"); err != nil {
+		return err
+	}
+	return ensureColumn(db, "functions", "cron", "TEXT")
 }
 
 // ensureColumn 给已存在的表补列（SQLite 无 ADD COLUMN IF NOT EXISTS，先查 PRAGMA）。
@@ -332,13 +341,18 @@ func (s *SQLiteStore) UnroutedEvents(ctx context.Context) ([]Event, error) {
 	return out, rows.Err()
 }
 
-// CreateRun 写入 run 初始状态（Queued）。
-func (s *SQLiteStore) CreateRun(ctx context.Context, r Run) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO runs (id, function_id, status, event_id, event_name, event_data, event_ts, created_at)
+// CreateRun 写入 run 初始状态（Queued）。幂等：同 ID 已存在时不覆盖，
+// 返回 created=false——路由的"对账扫描与 stream 消费重叠"双路由竞态靠它兜底（调用方不得再入队）。
+func (s *SQLiteStore) CreateRun(ctx context.Context, r Run) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO runs (id, function_id, status, event_id, event_name, event_data, event_ts, created_at)
 		 VALUES (?,?,?,?,?,?,?,?)`,
 		r.ID, r.FunctionID, RunQueued, r.EventID, r.EventName, string(r.EventData), fmtTime(r.EventTS), fmtTime(time.Now()))
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // GetRun 读取单个 run。
@@ -681,11 +695,11 @@ func (s *SQLiteStore) ReplaceAppFunctions(ctx context.Context, appURL string, fn
 	now := fmtTime(time.Now())
 	for _, f := range fns {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO functions (id, app_url, event, retries, cancel_on, updated_at) VALUES (?,?,?,?,?,?)
+			`INSERT INTO functions (id, app_url, event, match, cron, retries, cancel_on, updated_at) VALUES (?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET
-			   app_url=excluded.app_url, event=excluded.event,
+			   app_url=excluded.app_url, event=excluded.event, match=excluded.match, cron=excluded.cron,
 			   retries=excluded.retries, cancel_on=excluded.cancel_on, updated_at=excluded.updated_at`,
-			f.ID, appURL, f.Event, f.Retries, f.CancelOn, now); err != nil {
+			f.ID, appURL, f.Event, f.Match, f.Cron, f.Retries, f.CancelOn, now); err != nil {
 			return err
 		}
 	}
@@ -695,7 +709,8 @@ func (s *SQLiteStore) ReplaceAppFunctions(ctx context.Context, appURL string, fn
 // LoadRegisteredFunctions 返回全部持久化的函数注册记录（启动恢复用），按 app_url, id 排序。
 func (s *SQLiteStore) LoadRegisteredFunctions(ctx context.Context) ([]RegisteredFunction, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, app_url, event, retries, COALESCE(cancel_on, '') FROM functions ORDER BY app_url, id`)
+		`SELECT id, app_url, event, COALESCE(match, ''), COALESCE(cron, ''), retries, COALESCE(cancel_on, '')
+		 FROM functions ORDER BY app_url, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -703,7 +718,7 @@ func (s *SQLiteStore) LoadRegisteredFunctions(ctx context.Context) ([]Registered
 	var out []RegisteredFunction
 	for rows.Next() {
 		var f RegisteredFunction
-		if err := rows.Scan(&f.ID, &f.AppURL, &f.Event, &f.Retries, &f.CancelOn); err != nil {
+		if err := rows.Scan(&f.ID, &f.AppURL, &f.Event, &f.Match, &f.Cron, &f.Retries, &f.CancelOn); err != nil {
 			return nil, err
 		}
 		out = append(out, f)

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,6 +140,107 @@ func TestManifestCancelOn(t *testing.T) {
 	if !bytes.Contains(body, []byte(`"cancel_on"`)) ||
 		bytes.Count(body, []byte(`"match"`)) != 1 {
 		t.Fatalf("body=%s", body)
+	}
+}
+
+func TestManifestMatchCron(t *testing.T) {
+	fn := CreateFunction(FunctionOpts{
+		ID: "nightly-report", Event: "report/generate",
+		Match: "data.kind == 'full'", Cron: "0 9 * * *",
+	}, func(ctx context.Context, in Input) (any, error) { return nil, nil })
+	plain := CreateFunction(FunctionOpts{ID: "plain", Event: "x/y"},
+		func(ctx context.Context, in Input) (any, error) { return nil, nil })
+	h := Serve(testClient(), fn, plain)
+	req := httptest.NewRequest(http.MethodGet, "/api/triggerlink", nil)
+	req.Header.Set("X-TriggerLink-Signature", signHeader("k", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	body := rec.Body.Bytes()
+
+	var m struct {
+		Functions []struct {
+			ID    string `json:"id"`
+			Match string `json:"match"`
+			Cron  string `json:"cron"`
+		} `json:"functions"`
+	}
+	json.Unmarshal(body, &m)
+	byID := map[string]struct {
+		Match string
+		Cron  string
+	}{}
+	for _, f := range m.Functions {
+		byID[f.ID] = struct {
+			Match string
+			Cron  string
+		}{f.Match, f.Cron}
+	}
+	if byID["nightly-report"].Match != "data.kind == 'full'" || byID["nightly-report"].Cron != "0 9 * * *" {
+		t.Fatalf("manifest=%s", body)
+	}
+	// 未配置时按 omitempty 省略
+	if strings.Contains(string(body), `"id":"plain","event":"x/y","match"`) ||
+		strings.Contains(string(body), `"id":"plain","event":"x/y","cron"`) {
+		t.Fatalf("plain fn should omit match/cron: %s", body)
+	}
+}
+
+func TestOnFailureImplicitFunction(t *testing.T) {
+	fn := CreateFunction(FunctionOpts{
+		ID: "process-doc", Event: "doc/uploaded",
+		OnFailure: func(ctx context.Context, in Input) (any, error) {
+			return step.Run(ctx, "notify", func(ctx context.Context) (string, error) {
+				data, _ := json.Marshal(in.Event.Data)
+				return "notified:" + string(data), nil
+			})
+		},
+	}, func(ctx context.Context, in Input) (any, error) { return nil, nil })
+	h := Serve(testClient(), fn)
+
+	// manifest：隐式函数出现，id/订阅事件/match 断言
+	req := httptest.NewRequest(http.MethodGet, "/api/triggerlink", nil)
+	req.Header.Set("X-TriggerLink-Signature", signHeader("k", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var m struct {
+		Functions []struct {
+			ID    string `json:"id"`
+			Event string `json:"event"`
+			Match string `json:"match"`
+		} `json:"functions"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &m)
+	var implicit *struct {
+		ID    string `json:"id"`
+		Event string `json:"event"`
+		Match string `json:"match"`
+	}
+	for i, f := range m.Functions {
+		if f.ID == "process-doc/on-failure" {
+			implicit = &m.Functions[i]
+		}
+	}
+	if implicit == nil {
+		t.Fatalf("implicit on-failure fn missing: %s", rec.Body.Bytes())
+	}
+	if implicit.Event != "triggerlink/run.failed" ||
+		implicit.Match != "data.function_id == 'process-doc'" {
+		t.Fatalf("implicit=%+v", *implicit)
+	}
+
+	// 隐式函数可被正常回调执行（内部事件 data 透传给 handler）
+	failedEvent := map[string]any{
+		"run_id": "run_9", "function_id": "process-doc", "error": "boom",
+		"event": map[string]any{"id": "evt_1", "name": "doc/uploaded", "data": map[string]any{"doc_id": "d1"}},
+	}
+	body, _ := json.Marshal(map[string]any{"ctx": map[string]any{
+		"run_id": "run_of_1", "function_id": "process-doc/on-failure", "attempt": 1,
+		"event": map[string]any{"id": "evt_of", "name": "triggerlink/run.failed", "data": failedEvent, "ts": time.Now()},
+		"steps": map[string]any{},
+	}})
+	rec2, out := postExec(t, h, "k", body)
+	if rec2.Code != http.StatusOK || out["op"] != "StepComplete" || out["step_id"] != "notify" {
+		t.Fatalf("out=%v code=%d", out, rec2.Code)
 	}
 }
 

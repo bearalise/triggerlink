@@ -33,7 +33,21 @@ function json(data: unknown, status = 200): Response {
 
 export function serve(opts: ServeOptions) {
   const byID = new Map<string, TriggerFunction>();
-  for (const fn of opts.functions) byID.set(fn.opts.id, fn);
+  for (const fn of opts.functions) {
+    byID.set(fn.opts.id, fn);
+    if (fn.opts.onFailure) {
+      // FR-2.11：注册隐式函数，订阅 run 失败内部事件并按 function_id 过滤
+      byID.set(`${fn.opts.id}/on-failure`, {
+        opts: {
+          id: `${fn.opts.id}/on-failure`,
+          event: "triggerlink/run.failed",
+          match: `data.function_id == '${fn.opts.id}'`,
+          retries: 0,
+        },
+        handler: fn.opts.onFailure as TriggerFunction["handler"],
+      });
+    }
+  }
 
   async function GET(req: Request): Promise<Response> {
     if (!verifySignature(opts.client.signingKey, req.headers.get(SIGNATURE_HEADER), new Uint8Array(0))) {
@@ -45,6 +59,8 @@ export function serve(opts: ServeOptions) {
       functions: [...byID.values()].map((f) => ({
         id: f.opts.id,
         event: f.opts.event,
+        ...(f.opts.match ? { match: f.opts.match } : {}),
+        ...(f.opts.cron ? { cron: f.opts.cron } : {}),
         retries: f.opts.retries,
         ...(f.opts.cancelOn?.length
           ? { cancel_on: f.opts.cancelOn.map((c) => ({ event: c.event, match: c.match })) }

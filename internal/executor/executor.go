@@ -169,7 +169,7 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	}
 	fn, ok := e.Reg.Lookup(run.FunctionID)
 	if !ok {
-		e.Store.FailRun(ctx, run.ID, "function not registered: "+run.FunctionID)
+		e.failRun(ctx, run, "function not registered: "+run.FunctionID)
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		return
 	}
@@ -380,13 +380,48 @@ func (e *Executor) handleWaitForEvent(ctx context.Context, item store.QueueItem,
 
 func (e *Executor) retryOrFail(ctx context.Context, item store.QueueItem, run store.Run, attempt, maxAttempts int, msg string) {
 	if attempt >= maxAttempts {
-		e.Store.FailRun(ctx, run.ID, msg)
+		e.failRun(ctx, run, msg)
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		log.Printf("executor: run %s failed after %d attempts: %s", run.ID, attempt, msg)
 		return
 	}
 	log.Printf("executor: run %s attempt %d failed, retrying: %s", run.ID, attempt, msg)
 	e.Store.ReleaseLease(ctx, item.ID, time.Now().Add(e.backoff(attempt)))
+}
+
+// failRun 是 run 进入 Failed 终态的唯一出口（FR-2.11）：落终态后合成内部事件
+// triggerlink/run.failed，供用户以普通函数（订阅该事件 + match function_id）做 onFailure 补偿。
+func (e *Executor) failRun(ctx context.Context, run store.Run, errMsg string) {
+	if err := e.Store.FailRun(ctx, run.ID, errMsg); err != nil {
+		log.Printf("executor: fail run %s: %v", run.ID, err)
+		return
+	}
+	e.emitRunFailed(ctx, run, errMsg)
+}
+
+// emitRunFailed 合成 run 失败的内部事件：id = runfailed_<run_id>（确定性，
+// 崩溃重发由 InsertEvent 幂等去重），data 携带 run_id/function_id/error 与触发事件快照。
+// Stream 为 nil 时仅落库（测试用）；落库失败只记日志（M2：不重发，run 终态本身不丢）。
+func (e *Executor) emitRunFailed(ctx context.Context, run store.Run, errMsg string) {
+	data, err := json.Marshal(map[string]any{
+		"run_id":      run.ID,
+		"function_id": run.FunctionID,
+		"error":       errMsg,
+		"event":       eventPayload{ID: run.EventID, Name: run.EventName, Data: run.EventData, TS: run.EventTS},
+	})
+	if err != nil {
+		log.Printf("executor: marshal run.failed for run %s: %v", run.ID, err)
+		return
+	}
+	evt := store.Event{ID: "runfailed_" + run.ID, Name: "triggerlink/run.failed", Data: data, TS: time.Now()}
+	inserted, err := e.Store.InsertEvent(ctx, evt)
+	if err != nil {
+		log.Printf("executor: insert run.failed for run %s: %v", run.ID, err)
+		return
+	}
+	if inserted && e.Stream != nil {
+		e.Stream <- evt
+	}
 }
 
 func (e *Executor) backoff(attempt int) time.Duration {

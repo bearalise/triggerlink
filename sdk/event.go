@@ -27,21 +27,31 @@ type CancelOn struct {
 	Match string `json:"match,omitempty"`
 }
 
-// FunctionOpts 是函数定义配置。M0 仅支持事件触发。
+// FunctionHandler 是函数处理器类型，普通 handler 与 OnFailure handler 同型。
+type FunctionHandler func(ctx context.Context, in Input) (any, error)
+
+// FunctionOpts 是函数定义配置。
 type FunctionOpts struct {
 	ID       string     // 稳定标识，改名语义见 PRD 8.6
 	Event    string     // 订阅的事件名，如 "user/signup"
+	Match    string     // 事件触发 match 表达式（FR-3.1），expr 语法，环境只含 data（= 事件 data）
+	Cron     string     // 标准 5 字段 cron（分 时 日 月 周），UTC
 	Retries  int        // 重试上限；0 = 平台默认（4）
 	CancelOn []CancelOn // 取消规则，随 manifest 上报（cancel_on）
+	// OnFailure：run 进入 Failed 终态时的处理器（FR-2.11）。Serve 时注册隐式函数
+	// <id>/on-failure，订阅内部事件 triggerlink/run.failed（match 按 function_id 过滤），
+	// Input.Event.Data = {"run_id","function_id","error","event":{...触发事件...}}。
+	// OnFailure 自身失败不会递归触发。
+	OnFailure FunctionHandler
 }
 
 // Function 是一个 durable 函数定义。
 type Function struct {
 	opts    FunctionOpts
-	handler func(ctx context.Context, in Input) (any, error)
+	handler FunctionHandler
 }
 
 // CreateFunction 注册一个函数。handler 中的副作用必须放进 step.Run（PRD 8.1）。
-func CreateFunction(opts FunctionOpts, handler func(ctx context.Context, in Input) (any, error)) *Function {
+func CreateFunction(opts FunctionOpts, handler FunctionHandler) *Function {
 	return &Function{opts: opts, handler: handler}
 }

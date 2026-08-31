@@ -129,3 +129,47 @@ func TestAppFunctionsPersistence(t *testing.T) {
 		t.Fatalf("after reopen: %+v", got)
 	}
 }
+
+// TestAppFunctionsMatchCronRoundtrip：match/cron 列（FR-3.1 / FR-3.2）持久化往返，
+// 关闭重开（模拟平台重启）后仍在；未设置的函数读出为空串。
+func TestAppFunctionsMatchCronRoundtrip(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := st.ReplaceAppFunctions(ctx, "http://a/serve", []RegisteredFunction{
+		{ID: "f1", Event: "x/y", Match: `data.v > 10`, Cron: "*/5 * * * *", Retries: 2},
+		{ID: "f2", Event: "x/y"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.LoadRegisteredFunctions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Match != `data.v > 10` || got[0].Cron != "*/5 * * * *" {
+		t.Fatalf("roundtrip: %+v", got)
+	}
+	if got[1].Match != "" || got[1].Cron != "" {
+		t.Fatalf("unset match/cron must be empty: %+v", got[1])
+	}
+
+	// 重开库后仍在（列已落盘，ensureColumn 迁移幂等）
+	st.Close()
+	st2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { st2.Close() })
+	got, err = st2.LoadRegisteredFunctions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Match != `data.v > 10` || got[0].Cron != "*/5 * * * *" {
+		t.Fatalf("after reopen: %+v", got)
+	}
+}

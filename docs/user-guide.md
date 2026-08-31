@@ -285,6 +285,74 @@ fn := triggerlink.CreateFunction(
 
 The `Match` environment is the same as `step.WaitForEvent`: `data` = the arriving event's `data`, `event` = the run's triggering event `{name, data}`; an empty `Match` cancels on arrival. The TS SDK equivalent is `cancelOn: [{ event: "user/deleted", match: "..." }]` in `createFunction` options. Note the rules are evaluated against runs of the function that carries them — a run already in a terminal state is unaffected.
 
+### 5.3.5 Match / Cron (Trigger Conditions)
+
+`Match` narrows event triggering, and `Cron` adds a schedule trigger — both ship with the manifest:
+
+```go
+fn := triggerlink.CreateFunction(
+    triggerlink.FunctionOpts{
+        ID: "nightly-report", Event: "report/generate",
+        Match: "data.kind == 'full'", // only events whose data.kind is "full" trigger
+        Cron:  "0 9 * * *",           // also run every day at 09:00 UTC
+    },
+    handler,
+)
+```
+
+```ts
+const fn = createFunction(
+  {
+    id: "nightly-report",
+    event: "report/generate",
+    match: "data.kind == 'full'",
+    cron: "0 9 * * *",
+  },
+  handler,
+);
+```
+
+Notes:
+
+- `Match` is an expr-lang expression whose environment contains only `data` (= the event's `data`) — unlike `CancelOn`/`WaitForEvent`, there is no `event` variable.
+- `Cron` is a standard 5-field cron (minute hour day-of-month month day-of-week) interpreted in **UTC** with one-minute granularity; ticks missed while the platform is down are **not** backfilled — scheduling resumes from the next tick after a restart.
+
+### 5.3.6 OnFailure (Run-Failure Handler)
+
+`OnFailure` declares a handler that runs when the function's run reaches the Failed terminal state (all retries exhausted) — for alerts, compensating actions, and the like. The SDK registers an implicit function `<id>/on-failure` (subscribing to the internal event `triggerlink/run.failed`, filtered by `function_id`); it shows up in the manifest and Dashboard, and inside the handler you can use all step primitives:
+
+```go
+fn := triggerlink.CreateFunction(
+    triggerlink.FunctionOpts{
+        ID: "process-doc", Event: "doc/uploaded",
+        OnFailure: func(ctx context.Context, in triggerlink.Input) (any, error) {
+            // in.Event.Data = {"run_id","function_id","error","event":{...triggering event...}}
+            _, err := step.Run(ctx, "alert", func(ctx context.Context) (any, error) {
+                return nil, alertOps("process-doc failed: " + gjson.GetBytes(in.Event.Data, "error").String())
+            })
+            return nil, err
+        },
+    },
+    handler,
+)
+```
+
+```ts
+const fn = createFunction(
+  {
+    id: "process-doc",
+    event: "doc/uploaded",
+    onFailure: async ({ event, step }) => {
+      // event.data = { run_id, function_id, error, event: {...triggering event...} }
+      await step.run("alert", () => alertOps(`process-doc failed: ${event.data.error}`));
+    },
+  },
+  handler,
+);
+```
+
+The implicit function's own failure does **not** recursively trigger another failure handler (no re-entry).
+
 ### 5.4 Error Handling Semantics
 
 - A step returning an error → the platform records a failure memo and retries with backoff (starting at 1s, exponential, capped at 30s); after **4 total attempts by default** the run is marked Failed.

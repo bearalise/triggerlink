@@ -65,6 +65,32 @@ func TestRoutesStreamEvent(t *testing.T) {
 	waitRuns(t, st, 1)
 }
 
+// TestDoubleRouteIdempotent：同一事件被路由两次（启动对账与 stream 消费重叠的竞态）
+// 只产生一个 run 且只入队一次——run ID 由 (event_id, function_id) 确定性派生，
+// 第二次 CreateRun 幂等落空。
+func TestDoubleRouteIdempotent(t *testing.T) {
+	r, st, _ := setup(t)
+	ctx := context.Background()
+	e := store.Event{ID: "evt_dup", Name: "doc/uploaded",
+		Data: json.RawMessage(`{"doc_id":"d1"}`), TS: time.Now()}
+	if err := r.route(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.route(ctx, e); err != nil { // 模拟双路由
+		t.Fatal(err)
+	}
+	if n, _ := st.CountRuns(ctx); n != 1 {
+		t.Fatalf("runs=%d, want 1", n)
+	}
+	items, err := st.LeaseBatch(ctx, time.Now(), time.Minute, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue items=%d, want 1", len(items))
+	}
+}
+
 // TestDelayedEventNotLeasedBeforeTS：ts 为未来时间的延迟事件，到点前队列项不可租赁（FR-1.6）。
 func TestDelayedEventNotLeasedBeforeTS(t *testing.T) {
 	r, st, stream := setup(t)
@@ -126,7 +152,7 @@ func TestStartupReconciliation(t *testing.T) {
 func seedWaitingRun(t *testing.T, st store.Store, runID, fnID, eventName, match string, expires *time.Time) store.Wait {
 	t.Helper()
 	ctx := context.Background()
-	if err := st.CreateRun(ctx, store.Run{ID: runID, FunctionID: fnID, Status: store.RunQueued,
+	if _, err := st.CreateRun(ctx, store.Run{ID: runID, FunctionID: fnID, Status: store.RunQueued,
 		EventID: "evt_trig", EventName: "order/created",
 		EventData: json.RawMessage(`{"order_id":"o1"}`), EventTS: time.Now()}); err != nil {
 		t.Fatal(err)
@@ -286,7 +312,7 @@ func TestCancelOnCancelsActiveRun(t *testing.T) {
 
 	// 两个在途 run：o1（将被命中）、o2（match 不命中）；o1 还有一个挂起的 wait
 	seedWaitingRun(t, st, "run_o1", "fn-cancel", "order/payed", "", nil)
-	if err := st.CreateRun(context.Background(), store.Run{ID: "run_o2", FunctionID: "fn-cancel", Status: store.RunQueued,
+	if _, err := st.CreateRun(context.Background(), store.Run{ID: "run_o2", FunctionID: "fn-cancel", Status: store.RunQueued,
 		EventID: "evt_t2", EventName: "order/created",
 		EventData: json.RawMessage(`{"order_id":"o2"}`), EventTS: time.Now()}); err != nil {
 		t.Fatal(err)
