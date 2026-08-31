@@ -3,7 +3,7 @@
 > 目标：完成 PRD 第 6 章 M2 剩余功能——流控（debounce/throttle/batching）、可观测性（slog/metrics/保留策略）、Postgres 存储后端。
 > 依据：`docs/triggerlink-prd.md` FR-4.4/4.5/4.7、FR-6.3/6.4/6.6、第 7 章存储设计。
 > 现状基线：main @ c47d257 之后。SQLite 单后端；`store.Store` 接口约 40 个方法（`internal/store/store.go:122`）；执行器并发控制为内存 `inFlight` map（`internal/executor/executor.go:51`）；队列 = `queue_items` 表 + `UPDATE...RETURNING` 原子租赁；manifest 已有字段 id/event/match/cron/retries/cancel_on/timeout。
-> 执行顺序：**阶段 B（可观测性，已完成）→ 阶段 A（流控，已完成）→ 阶段 C（Postgres）**。B 独立且是压测/发布门禁的前提；A 动队列调度核心，放在观测能力就绪后便于验证；C 工作量最大且依赖 A/B 的 Store 接口最终形态。
+> 执行顺序：**阶段 B（可观测性，已完成）→ 阶段 A（流控，已完成）→ 阶段 C（Postgres，已完成）**。B 独立且是压测/发布门禁的前提；A 动队列调度核心，放在观测能力就绪后便于验证；C 工作量最大且依赖 A/B 的 Store 接口最终形态。
 > 每个阶段独立成 PR：开分支 → 实现 → 全量测试（含 e2e）→ 推送开 PR → 合并。SDK 有面向用户改动时发 npm patch/minor。
 
 ---
@@ -119,7 +119,16 @@
 
 ---
 
-## 阶段 C：Postgres 后端（PRD 7.3 P1 方案 / 13 章部署形态）
+## 阶段 C：Postgres 后端（PRD 7.3 P1 方案 / 13 章部署形态）✅ 已完成
+
+分支 `feat/postgres`，三个 commit。与计划的主要差异：
+
+- **不写第二份实现**：`store.Store` 到本阶段已是 57 个方法 / 1543 行，而实测方言差异面只有 6 处 `INSERT OR IGNORE`、1 处 `PRAGMA`。改为两个后端共用一套查询代码 + 方言层（占位符改写、DDL、补列三个钩子）。代价：Postgres 侧时间/JSON 也用 TEXT 列，放弃 C2 计划里的 TIMESTAMPTZ/JSONB。
+- **C2 的方言清单基本落空**：占位符与幂等插入按上面的方式统一处理；时间与 JSON 因为共用 TEXT 而无需分歧；`ensureColumn` 按方言分支。唯一计划外的改动是 `step_runs` 加 `seq` 列——Postgres 没有 SQLite 的隐式 `rowid`，而 step 时间线顺序是 Dashboard 可见行为。
+- **测试矩阵比计划更宽**：不是"e2e 只加一个 smoke"，而是 store 全套 + e2e 全套都在 Postgres 上跑通（每个用例独立 schema）。
+- 依赖锁 `pgx/v5 v5.6.0`（更高版本会顶高 go 指令，与 CI 的 1.23 冲突）。
+
+
 
 预估 3–5 天。M2 验收项，工作量最大。
 
