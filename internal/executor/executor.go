@@ -24,17 +24,18 @@ import (
 
 // Executor 执行队列中的 run。
 type Executor struct {
-	Store          store.Store
-	Reg            *registry.Registry
-	Client         *http.Client
-	SigningKey     string
-	Stream         chan<- store.Event // step.sendEvent 扇出用；nil 时仅落库不入流（测试用）
-	MaxRetries     int                // 默认 4；M0：回调尝试总数上限；函数注册了 Retries 时被其覆盖
-	Concurrency    int                // 每函数并发 run 上限，默认 100
-	BatchSize      int                // 每轮租赁上限，默认 16
-	PollInterval   time.Duration      // 默认 100ms
-	LeaseDuration  time.Duration      // 默认 30s
-	BaseBackoff    time.Duration      // 默认 1s；退避 = BaseBackoff << attempt，封顶 30s
+	Store               store.Store
+	Reg                 *registry.Registry
+	Client              *http.Client
+	SigningKey          string
+	Stream              chan<- store.Event // step.sendEvent 扇出用；nil 时仅落库不入流（测试用）
+	MaxRetries          int                // 默认 4；M0：回调尝试总数上限；函数注册了 Retries 时被其覆盖
+	Concurrency         int                // 每函数并发 run 上限，默认 100
+	BatchSize           int                // 每轮租赁上限，默认 16
+	PollInterval        time.Duration      // 默认 100ms
+	LeaseDuration       time.Duration      // 默认 30s
+	BaseBackoff         time.Duration      // 默认 1s；退避 = BaseBackoff << attempt，封顶 30s
+	TimeoutScanInterval time.Duration      // run 超时扫描（FR-4.3）间隔，默认 1s
 }
 
 // Run 阻塞运行直到 ctx 取消。启动先做租约对账（崩溃恢复）。
@@ -50,10 +51,15 @@ func (e *Executor) Run(ctx context.Context) error {
 	inFlight := map[string]int{}
 	tick := time.NewTicker(e.PollInterval)
 	defer tick.Stop()
+	timeoutTick := time.NewTicker(e.TimeoutScanInterval)
+	defer timeoutTick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-timeoutTick.C:
+			e.scanRunTimeouts(ctx)
+			continue
 		case <-tick.C:
 		}
 		items, err := e.Store.LeaseBatch(ctx, time.Now(), e.LeaseDuration, e.BatchSize)
@@ -96,6 +102,9 @@ func (e *Executor) defaults() {
 	}
 	if e.BaseBackoff <= 0 {
 		e.BaseBackoff = time.Second
+	}
+	if e.TimeoutScanInterval <= 0 {
+		e.TimeoutScanInterval = time.Second
 	}
 	if e.Client == nil {
 		e.Client = &http.Client{Timeout: 5 * time.Minute} // PRD 8.3：step 内同步执行，默认 5 分钟
@@ -246,10 +255,12 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		return
 	}
 
-	// 回调在途期间 run 可能被取消：推进/重试前重检状态，取消则丢弃 opcode 收尾。
-	if latest, err := e.Store.GetRun(ctx, run.ID); err == nil && latest.Status == store.RunCancelled {
+	// 回调在途期间 run 可能已到终态（取消、超时扫描置 Failed）：推进/重试前重检，
+	// 终态则丢弃 opcode 收尾，避免把已终结的 run 继续往下推。
+	if latest, err := e.Store.GetRun(ctx, run.ID); err == nil &&
+		(latest.Status == store.RunCancelled || latest.Status == store.RunCompleted || latest.Status == store.RunFailed) {
 		e.Store.CompleteQueueItem(ctx, item.ID)
-		log.Printf("executor: run %s cancelled in flight, discarding %s", run.ID, op.Op)
+		log.Printf("executor: run %s reached %s in flight, discarding %s", run.ID, latest.Status, op.Op)
 		return
 	}
 
@@ -376,6 +387,37 @@ func (e *Executor) handleWaitForEvent(ctx context.Context, item store.QueueItem,
 	}
 	e.Store.CompleteQueueItem(ctx, item.ID)
 	log.Printf("executor: run %s waiting for event %s", run.ID, op.Event)
+}
+
+// scanRunTimeouts 扫描 run 级超时（FR-4.3）：对注册了 Timeout 的函数，其在途 run
+// 从 created_at 起超过 Timeout 仍在 Queued/Running → 走 failRun 语义置 Failed
+// （TimeoutRun 事务内清理 pending 队列项；transitioned 后合成 triggerlink/run.failed 事件）。
+func (e *Executor) scanRunTimeouts(ctx context.Context) {
+	for _, fn := range e.Reg.All() {
+		if fn.Timeout <= 0 {
+			continue
+		}
+		runs, err := e.Store.ActiveRunsByFunction(ctx, fn.ID)
+		if err != nil {
+			log.Printf("executor: timeout scan list runs for %s: %v", fn.ID, err)
+			continue
+		}
+		for _, run := range runs {
+			if time.Since(run.CreatedAt) <= fn.Timeout {
+				continue
+			}
+			msg := fmt.Sprintf("run timeout after %s", fn.Timeout)
+			transitioned, err := e.Store.TimeoutRun(ctx, run.ID, msg)
+			if err != nil {
+				log.Printf("executor: timeout run %s: %v", run.ID, err)
+				continue
+			}
+			if transitioned {
+				e.emitRunFailed(ctx, run, msg)
+				log.Printf("executor: run %s timed out (%s)", run.ID, msg)
+			}
+		}
+	}
 }
 
 func (e *Executor) retryOrFail(ctx context.Context, item store.QueueItem, run store.Run, attempt, maxAttempts int, msg string) {

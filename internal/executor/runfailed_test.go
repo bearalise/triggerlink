@@ -46,8 +46,16 @@ func TestRunFailedEmitsEvent(t *testing.T) {
 
 	e.waitStatus(t, store.RunFailed)
 
-	// 落库断言：事件 id / data 字段
-	evts := runFailedEvents(t, e.store)
+	// FailRun 落终态与 emit 事件合成是两次独立存储调用（见 failRun 注释），
+	// waitStatus 观察到 Failed 时 emit 可能尚未完成——轮询等待而非立即断言。
+	var evts []store.Event
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if evts = runFailedEvents(t, e.store); len(evts) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if len(evts) != 1 {
 		t.Fatalf("run.failed events=%d, want 1", len(evts))
 	}

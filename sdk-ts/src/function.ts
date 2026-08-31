@@ -51,6 +51,12 @@ export interface FunctionOpts {
   /** 取消规则，随 manifest 上报为 cancel_on */
   cancelOn?: CancelOnRule[];
   /**
+   * run 级超时（FR-4.3），随 manifest 上报为 timeout（Go duration 字符串或毫秒数，
+   * 如 "5m" 或 300000）。run 从创建起超过该时长仍在 Queued/Running，平台置 Failed
+   * 并发 triggerlink/run.failed 事件——配置了 onFailure 的函数会因此触发。缺省 = 不限时。
+   */
+  timeout?: string | number;
+  /**
    * run 进入 Failed 终态时的处理器（FR-2.11）。serve 时注册隐式函数 <id>/on-failure，
    * 订阅内部事件 triggerlink/run.failed（match 按 function_id 过滤），handler 内可用全部 step 原语。
    * onFailure 自身失败不会递归触发。

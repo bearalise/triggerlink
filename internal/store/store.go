@@ -98,6 +98,7 @@ type Wait struct {
 // 以函数 ID 为主键：函数迁移到新 appURL 时 upsert 覆盖旧行，与 Registry.Sync 语义对齐。
 // CancelOn 是 cancelOn 规则（FR-4.9）的 JSON 序列化形态，空串表示无。
 // Match / Cron 分别是事件触发过滤（FR-3.1）与 cron 触发（FR-3.2）表达式，空串表示无。
+// Timeout 是 run 级超时（FR-4.3）：0 表示不限制。
 type RegisteredFunction struct {
 	ID       string
 	AppURL   string
@@ -106,6 +107,7 @@ type RegisteredFunction struct {
 	Cron     string
 	Retries  int
 	CancelOn string
+	Timeout  time.Duration
 }
 
 // QueueItem 是队列中的待执行单元；score 决定 FIFO 顺序，at 是"不早于"时间（退避用）。
@@ -159,6 +161,11 @@ type Store interface {
 
 	ReplaceAppFunctions(ctx context.Context, appURL string, fns []RegisteredFunction) error
 	LoadRegisteredFunctions(ctx context.Context) ([]RegisteredFunction, error)
+
+	SetFunctionPaused(ctx context.Context, functionID string, paused bool) error
+	IsFunctionPaused(ctx context.Context, functionID string) (bool, error)
+	PausedFunctionIDs(ctx context.Context) (map[string]bool, error)
+	TimeoutRun(ctx context.Context, id string, errMsg string) (bool, error)
 }
 
 // SQLiteStore 是 Store 的 SQLite 实现。
@@ -250,6 +257,10 @@ CREATE TABLE IF NOT EXISTS waits (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_waits_run_step ON waits(run_id, step_hash);
 CREATE INDEX IF NOT EXISTS idx_waits_event ON waits(status, event_name);
+CREATE TABLE IF NOT EXISTS paused_functions (
+  function_id TEXT PRIMARY KEY,
+  paused_at   TEXT NOT NULL
+);
 `)
 	if err != nil {
 		return err
@@ -264,7 +275,10 @@ CREATE INDEX IF NOT EXISTS idx_waits_event ON waits(status, event_name);
 	if err := ensureColumn(db, "functions", "match", "TEXT"); err != nil {
 		return err
 	}
-	return ensureColumn(db, "functions", "cron", "TEXT")
+	if err := ensureColumn(db, "functions", "cron", "TEXT"); err != nil {
+		return err
+	}
+	return ensureColumn(db, "functions", "timeout", "TEXT")
 }
 
 // ensureColumn 给已存在的表补列（SQLite 无 ADD COLUMN IF NOT EXISTS，先查 PRAGMA）。
@@ -401,19 +415,20 @@ func (s *SQLiteStore) MarkRunRunning(ctx context.Context, id string) (bool, erro
 	return n == 1, err
 }
 
-// CompleteRun 落终态 Completed + 输出。
+// CompleteRun 落终态 Completed + 输出。条件更新：仅 Queued/Running 可转换，
+// 防止在途回调的晚到响应覆盖已落地的终态（如 run 超时已被扫描置 Failed）。
 func (s *SQLiteStore) CompleteRun(ctx context.Context, id string, output json.RawMessage) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE runs SET status=?, output=?, ended_at=? WHERE id=?`,
-		RunCompleted, string(output), fmtTime(time.Now()), id)
+		`UPDATE runs SET status=?, output=?, ended_at=? WHERE id=? AND status IN (?,?)`,
+		RunCompleted, string(output), fmtTime(time.Now()), id, RunQueued, RunRunning)
 	return err
 }
 
-// FailRun 落终态 Failed + 错误信息。
+// FailRun 落终态 Failed + 错误信息。同样仅 Queued/Running 可转换（终态不可覆盖）。
 func (s *SQLiteStore) FailRun(ctx context.Context, id string, errMsg string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE runs SET status=?, error=?, ended_at=? WHERE id=?`,
-		RunFailed, errMsg, fmtTime(time.Now()), id)
+		`UPDATE runs SET status=?, error=?, ended_at=? WHERE id=? AND status IN (?,?)`,
+		RunFailed, errMsg, fmtTime(time.Now()), id, RunQueued, RunRunning)
 	return err
 }
 
@@ -429,6 +444,34 @@ func (s *SQLiteStore) CancelRun(ctx context.Context, id string) (bool, error) {
 	res, err := tx.ExecContext(ctx,
 		`UPDATE runs SET status=?, ended_at=? WHERE id=? AND status IN (?,?)`,
 		RunCancelled, fmtTime(time.Now()), id, RunQueued, RunRunning)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 1 {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM queue_items WHERE run_id=? AND status=?`, id, QueuePending); err != nil {
+			return false, err
+		}
+	}
+	return n == 1, tx.Commit()
+}
+
+// TimeoutRun 把 Queued/Running 的 run 置为终态 Failed（FR-4.3 run 超时），并同事务删除其
+// pending 队列项（防止 executor 再次拉起）。返回 transitioned=false 表示 run 已处终态（幂等）。
+// triggerlink/run.failed 内部事件由调用方（executor）在 transitioned=true 时合成。
+func (s *SQLiteStore) TimeoutRun(ctx context.Context, id string, errMsg string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE runs SET status=?, error=?, ended_at=? WHERE id=? AND status IN (?,?)`,
+		RunFailed, errMsg, fmtTime(time.Now()), id, RunQueued, RunRunning)
 	if err != nil {
 		return false, err
 	}
@@ -592,11 +635,12 @@ func (s *SQLiteStore) CancelWaitsForRun(ctx context.Context, runID string) (int,
 	return int(n), err
 }
 
-// ActiveRunsByFunction 返回某函数的全部非终态 run（cancelOn 匹配的候选集，FR-4.9）。
-// 带触发事件名/数据：cancelOn 的 match 表达式需要以 run 触发事件作为 event 环境。
+// ActiveRunsByFunction 返回某函数的全部非终态 run（cancelOn 匹配的候选集，FR-4.9；
+// run 超时扫描（FR-4.3）也用它，故带 created_at）。带触发事件名/数据：
+// cancelOn 的 match 表达式需要以 run 触发事件作为 event 环境。
 func (s *SQLiteStore) ActiveRunsByFunction(ctx context.Context, functionID string) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, function_id, status, event_id, event_name, event_data, event_ts
+		`SELECT id, function_id, status, event_id, event_name, event_data, event_ts, created_at
 		 FROM runs WHERE function_id=? AND status IN (?,?)`, functionID, RunQueued, RunRunning)
 	if err != nil {
 		return nil, err
@@ -605,12 +649,15 @@ func (s *SQLiteStore) ActiveRunsByFunction(ctx context.Context, functionID strin
 	var out []Run
 	for rows.Next() {
 		var r Run
-		var edata, ets string
-		if err := rows.Scan(&r.ID, &r.FunctionID, &r.Status, &r.EventID, &r.EventName, &edata, &ets); err != nil {
+		var edata, ets, cat string
+		if err := rows.Scan(&r.ID, &r.FunctionID, &r.Status, &r.EventID, &r.EventName, &edata, &ets, &cat); err != nil {
 			return nil, err
 		}
 		r.EventData = json.RawMessage(edata)
 		if r.EventTS, err = parseTime(ets); err != nil {
+			return nil, err
+		}
+		if r.CreatedAt, err = parseTime(cat); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -694,12 +741,16 @@ func (s *SQLiteStore) ReplaceAppFunctions(ctx context.Context, appURL string, fn
 	}
 	now := fmtTime(time.Now())
 	for _, f := range fns {
+		timeout := ""
+		if f.Timeout > 0 {
+			timeout = f.Timeout.String()
+		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO functions (id, app_url, event, match, cron, retries, cancel_on, updated_at) VALUES (?,?,?,?,?,?,?,?)
+			`INSERT INTO functions (id, app_url, event, match, cron, retries, cancel_on, timeout, updated_at) VALUES (?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET
 			   app_url=excluded.app_url, event=excluded.event, match=excluded.match, cron=excluded.cron,
-			   retries=excluded.retries, cancel_on=excluded.cancel_on, updated_at=excluded.updated_at`,
-			f.ID, appURL, f.Event, f.Match, f.Cron, f.Retries, f.CancelOn, now); err != nil {
+			   retries=excluded.retries, cancel_on=excluded.cancel_on, timeout=excluded.timeout, updated_at=excluded.updated_at`,
+			f.ID, appURL, f.Event, f.Match, f.Cron, f.Retries, f.CancelOn, timeout, now); err != nil {
 			return err
 		}
 	}
@@ -709,7 +760,7 @@ func (s *SQLiteStore) ReplaceAppFunctions(ctx context.Context, appURL string, fn
 // LoadRegisteredFunctions 返回全部持久化的函数注册记录（启动恢复用），按 app_url, id 排序。
 func (s *SQLiteStore) LoadRegisteredFunctions(ctx context.Context) ([]RegisteredFunction, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, app_url, event, COALESCE(match, ''), COALESCE(cron, ''), retries, COALESCE(cancel_on, '')
+		`SELECT id, app_url, event, COALESCE(match, ''), COALESCE(cron, ''), retries, COALESCE(cancel_on, ''), COALESCE(timeout, '')
 		 FROM functions ORDER BY app_url, id`)
 	if err != nil {
 		return nil, err
@@ -718,10 +769,56 @@ func (s *SQLiteStore) LoadRegisteredFunctions(ctx context.Context) ([]Registered
 	var out []RegisteredFunction
 	for rows.Next() {
 		var f RegisteredFunction
-		if err := rows.Scan(&f.ID, &f.AppURL, &f.Event, &f.Match, &f.Cron, &f.Retries, &f.CancelOn); err != nil {
+		var timeout string
+		if err := rows.Scan(&f.ID, &f.AppURL, &f.Event, &f.Match, &f.Cron, &f.Retries, &f.CancelOn, &timeout); err != nil {
 			return nil, err
 		}
+		if timeout != "" {
+			// 落库值来自 time.Duration.String()；解析失败视为不限制（0）
+			if d, err := time.ParseDuration(timeout); err == nil {
+				f.Timeout = d
+			}
+		}
 		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// SetFunctionPaused 设置/清除函数的暂停标记（FR-7.3）。暂停状态存于独立的
+// paused_functions 表：ReplaceAppFunctions 整体覆盖 functions 表时不随之丢失。
+func (s *SQLiteStore) SetFunctionPaused(ctx context.Context, functionID string, paused bool) error {
+	if paused {
+		_, err := s.db.ExecContext(ctx,
+			`INSERT OR REPLACE INTO paused_functions (function_id, paused_at) VALUES (?,?)`,
+			functionID, fmtTime(time.Now()))
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM paused_functions WHERE function_id=?`, functionID)
+	return err
+}
+
+// IsFunctionPaused 查询函数是否处于暂停状态。
+func (s *SQLiteStore) IsFunctionPaused(ctx context.Context, functionID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM paused_functions WHERE function_id=?`, functionID).Scan(&n)
+	return n > 0, err
+}
+
+// PausedFunctionIDs 返回全部暂停函数的 ID 集合（dashboard 列表 join 用）。
+func (s *SQLiteStore) PausedFunctionIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT function_id FROM paused_functions`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
 	}
 	return out, rows.Err()
 }

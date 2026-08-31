@@ -126,3 +126,28 @@ func listRuns(t *testing.T, st store.Store) []store.Run {
 	}
 	return runs
 }
+
+// TestCronPausedFunctionNotFired：暂停的函数 cron 到点不触发（FR-7.3）；恢复后正常触发。
+func TestCronPausedFunctionNotFired(t *testing.T) {
+	s, st := setupSched(t, registry.Function{ID: "fn-cron", Cron: "* * * * *", AppURL: "http://app/serve"})
+	ctx := context.Background()
+	if err := st.SetFunctionPaused(ctx, "fn-cron", true); err != nil {
+		t.Fatal(err)
+	}
+
+	t0 := time.Date(2026, 8, 31, 10, 0, 30, 0, time.UTC)
+	s.check(ctx, t0) // 建立基线
+	s.check(ctx, t0.Add(45*time.Second))
+	if n, _ := st.CountRuns(ctx); n != 0 {
+		t.Fatalf("paused function fired %d runs", n)
+	}
+
+	// 恢复后窗口推进到下一分钟 → 正常触发
+	if err := st.SetFunctionPaused(ctx, "fn-cron", false); err != nil {
+		t.Fatal(err)
+	}
+	s.check(ctx, t0.Add(90*time.Second))
+	if n, _ := st.CountRuns(ctx); n != 1 {
+		t.Fatalf("resumed function not fired, runs=%d, want 1", n)
+	}
+}

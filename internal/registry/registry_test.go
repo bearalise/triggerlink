@@ -111,3 +111,31 @@ func TestSyncMigratesFunctionAcrossURLs(t *testing.T) {
 		t.Fatalf("apps=%v", apps)
 	}
 }
+
+// TestManifestTimeoutParsing：清单 JSON 的 timeout 字段（FR-4.3，Go duration 字符串）——
+// 合法值解析为 Timeout；非法值记日志并视为 0（不限制）；缺省为 0。
+func TestManifestTimeoutParsing(t *testing.T) {
+	var f Function
+	if err := json.Unmarshal([]byte(`{"id":"f1","event":"x/y","timeout":"5m"}`), &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.Timeout != 5*time.Minute {
+		t.Fatalf("timeout=%v, want 5m", f.Timeout)
+	}
+
+	var bad Function
+	if err := json.Unmarshal([]byte(`{"id":"f2","event":"x/y","timeout":"not-a-duration"}`), &bad); err != nil {
+		t.Fatal(err)
+	}
+	if bad.Timeout != 0 {
+		t.Fatalf("invalid timeout must be treated as unlimited, got %v", bad.Timeout)
+	}
+
+	var none Function
+	if err := json.Unmarshal([]byte(`{"id":"f3","event":"x/y"}`), &none); err != nil {
+		t.Fatal(err)
+	}
+	if none.Timeout != 0 {
+		t.Fatalf("missing timeout must be 0, got %v", none.Timeout)
+	}
+}

@@ -19,5 +19,8 @@ function qs(params) {
 export const fetchRuns = (params = {}) => get(`/runs?${qs(params)}`)
 export const fetchRun = (id) => get(`/runs/${id}`)
 export const cancelRun = (id) => post(`/runs/${id}/cancel`)
+export const replayRun = (id) => post(`/runs/${id}/replay`)
 export const fetchEvents = (params = {}) => get(`/events?${qs(params)}`)
 export const fetchFunctions = () => get('/functions')
+export const pauseFunction = (id) => post(`/functions/${encodeURIComponent(id)}/pause`)
+export const resumeFunction = (id) => post(`/functions/${encodeURIComponent(id)}/resume`)

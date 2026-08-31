@@ -63,6 +63,13 @@ func (r *Runner) Run(ctx context.Context) error {
 
 func (r *Runner) route(ctx context.Context, e store.Event) error {
 	for _, f := range r.Reg.Match(e.Name) {
+		// 暂停的函数不接新触发（FR-7.3）：跳过建 run；事件仍照常标记 routed。
+		// 查询失败时 fail-open（不跳过），避免存储抖动导致触发丢失。
+		if paused, err := r.Store.IsFunctionPaused(ctx, f.ID); err != nil {
+			log.Printf("runner: check paused %s: %v", f.ID, err)
+		} else if paused {
+			continue
+		}
 		// 事件触发 match（FR-3.1）：非空且不命中（含编译/求值失败）则不为该函数建 run。
 		if !evalTriggerMatch(f.Match, e) {
 			continue

@@ -67,6 +67,7 @@ At startup, the platform sends one signed GET (no body) to each configured `-app
 | `functions[].cron` | string | Optional schedule trigger, omitted when empty. Standard 5-field cron (minute hour day-of-month month day-of-week), **UTC** |
 | `functions[].retries` | int | Retry limit; 0 = platform default (4). The M0 platform does not yet differentiate this per function |
 | `functions[].cancel_on` | array | Optional cancel rules: `[{"event": "user/deleted", "match": "data.user_id == event.data.user_id"}]`. When the named event arrives and `match` evaluates true, the platform cancels that function's in-flight (Queued/Running) runs; an omitted `match` means "cancel on arrival". `match` is an expr-lang expression evaluated with `data` = the arriving event's `data` and `event` = the run's triggering event `{"name", "data"}` |
+| `functions[].timeout` | string | Optional run-level timeout (FR-4.3) as a Go duration string (e.g. `"5m"`, `"168h"`), omitted when unset. If a run is still Queued/Running this long after creation, the platform marks it `Failed` and emits `triggerlink/run.failed` (so the function's `onFailure` handler fires, Section 3.2). Absent = no time limit |
 
 Non-200 response or timeout: the platform logs a warning and skips that app (non-fatal; other apps register as usual).
 
@@ -337,3 +338,17 @@ Sync semantics replace the entire function set for a serve URL: renamed/deleted 
 Static introspection of `-app` URLs at startup is retained and can be mixed with dynamic registration (for the same URL, the later registration overrides the earlier one).
 
 See `internal/appapi/handler.go` for details.
+
+### Admin API: Run/Function Operations (Dashboard basic auth)
+
+The following endpoints sit under the same `/api/v1/*` namespace as the Dashboard's read APIs and are protected by **Dashboard basic auth** (not the event-key Bearer above):
+
+```
+POST /api/v1/runs/{id}/replay       → 200 {"run_id": "<new run id>"}; 404 if the run does not exist
+POST /api/v1/functions/{id}/pause   → 200 {}
+POST /api/v1/functions/{id}/resume  → 200 {}
+GET  /api/v1/functions              → each entry additionally carries "paused": bool
+```
+
+- **Replay** creates a brand-new run from the original run's triggering-event snapshot and executes it from scratch — no step memos are inherited from the original run.
+- **Pause** stops the function from accepting new triggers; in-flight runs continue to completion. **Resume** re-enables triggering.

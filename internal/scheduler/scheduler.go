@@ -85,6 +85,12 @@ func (s *Scheduler) check(ctx context.Context, now time.Time) {
 	s.mu.Unlock()
 
 	for _, f := range s.Reg.CronFunctions() {
+		// 暂停的函数不接新触发（FR-7.3）：cron 到点同样跳过；查询失败 fail-open。
+		if paused, err := s.Store.IsFunctionPaused(ctx, f.ID); err != nil {
+			log.Printf("scheduler: check paused %s: %v", f.ID, err)
+		} else if paused {
+			continue
+		}
 		sched, err := s.scheduleFor(f)
 		if err != nil {
 			log.Printf("scheduler: cron parse %q (function %s): %v", f.Cron, f.ID, err)

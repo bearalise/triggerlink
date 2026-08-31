@@ -347,3 +347,43 @@ func TestCancelOnCancelsActiveRun(t *testing.T) {
 		t.Fatalf("waits of cancelled run: %+v", waits)
 	}
 }
+
+// TestPausedFunctionNotRouted：暂停的函数不接新触发（FR-7.3）——路由时跳过建 run，
+// 但事件仍照常标记 routed；恢复后新事件正常建 run。
+func TestPausedFunctionNotRouted(t *testing.T) {
+	r, st, _ := setup(t)
+	ctx := context.Background()
+	if err := st.SetFunctionPaused(ctx, "process-doc", true); err != nil {
+		t.Fatal(err)
+	}
+
+	e := store.Event{ID: "evt_p1", Name: "doc/uploaded", Data: json.RawMessage(`{}`), TS: time.Now()}
+	if _, err := st.InsertEvent(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.route(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := st.CountRuns(ctx); n != 0 {
+		t.Fatalf("paused function routed, runs=%d, want 0", n)
+	}
+	// 事件仍标记 routed（不对账重扫）
+	if evts, _ := st.UnroutedEvents(ctx); len(evts) != 0 {
+		t.Fatalf("event not marked routed: %+v", evts)
+	}
+
+	// 恢复后：新事件正常建 run
+	if err := st.SetFunctionPaused(ctx, "process-doc", false); err != nil {
+		t.Fatal(err)
+	}
+	e2 := store.Event{ID: "evt_p2", Name: "doc/uploaded", Data: json.RawMessage(`{}`), TS: time.Now()}
+	if _, err := st.InsertEvent(ctx, e2); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.route(ctx, e2); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := st.CountRuns(ctx); n != 1 {
+		t.Fatalf("resumed function not routed, runs=%d, want 1", n)
+	}
+}
