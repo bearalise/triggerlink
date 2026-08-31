@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/bearalise/triggerlink/internal/eventapi"
 	"github.com/bearalise/triggerlink/internal/executor"
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/janitor"
 	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/runner"
@@ -35,6 +37,13 @@ var version = "dev"
 
 // metricsSampleInterval 是 queue_depth / waits_active 两个 gauge 的采样周期。
 const metricsSampleInterval = 10 * time.Second
+
+// 保留策略（FR-6.6）：清理周期，以及保留期下限——事件去重窗口是 24h，
+// 保留期短于它会把仍在去重窗口内的事件删掉，使重复投递不再被识别。
+const (
+	retentionInterval = time.Hour
+	minRetentionDays  = 1
+)
 
 type stringSlice []string
 
@@ -66,6 +75,7 @@ func main() {
 	var addr, dbPath, eventKey, signingKey string
 	var apps stringSlice
 	var dashAuth, logLevel string
+	var retentionDays int
 	fs := flag.NewFlagSet("triggerlink "+cmd, flag.ExitOnError)
 	fs.StringVar(&addr, "addr", ":8288", "Event API 监听地址")
 	fs.StringVar(&dbPath, "db", "triggerlink.db", "SQLite 数据库路径")
@@ -73,6 +83,7 @@ func main() {
 	fs.StringVar(&signingKey, "signing-key", "", "平台→应用回调签名密钥（start 必填，dev 缺省自动生成）")
 	fs.StringVar(&dashAuth, "dashboard-auth", "", "Dashboard basic auth 凭据 user:password（默认读 TRIGGERLINK_DASHBOARD_AUTH；都为空则生成随机密码打日志）")
 	fs.StringVar(&logLevel, "log-level", "", "日志级别 debug|info|warn|error（默认 info；env TRIGGERLINK_LOG_LEVEL 兜底）")
+	fs.IntVar(&retentionDays, "retention-days", 0, "历史数据保留天数（终态 run / 事件 / 已解除 wait），默认 30；0 表示读 env TRIGGERLINK_RETENTION_DAYS，负数表示关闭清理")
 	fs.Var(&apps, "app", "应用 serve URL（可重复，如 http://localhost:8080/api/triggerlink）")
 	fs.Parse(args)
 
@@ -95,6 +106,11 @@ func main() {
 	}
 	if eventKey == "" || signingKey == "" {
 		fatal("必须提供 -event-key 与 -signing-key（或使用 triggerlink dev 自动生成）")
+	}
+
+	retention, err := resolveRetention(retentionDays)
+	if err != nil {
+		fatal("-retention-days", "err", err)
 	}
 
 	st, err := store.Open(dbPath)
@@ -181,6 +197,12 @@ func main() {
 	}()
 	// 队列深度 / 活跃 wait 数按固定周期采样（不挂在 /metrics 抓取路径上，FR-6.4）。
 	go metrics.StartSampler(ctx, st, metricsSampleInterval)
+	jan := &janitor.Janitor{Store: st, Retention: retention, Interval: retentionInterval}
+	go func() {
+		if err := jan.Run(ctx); err != nil {
+			slog.Error("janitor exited", "err", err)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/events", eventapi.NewHandler(st, eventKey, stream))
@@ -210,7 +232,8 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("triggerlink listening", "version", version, "mode", cmd, "addr", addr, "db", dbPath, "apps", len(apps))
+	slog.Info("triggerlink listening", "version", version, "mode", cmd, "addr", addr, "db", dbPath,
+		"apps", len(apps), "retention", retention)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		fatal("http server", "err", err)
 	}
@@ -237,6 +260,33 @@ func parseLogLevel(flagVal string) (slog.Level, string) {
 	default:
 		return slog.LevelInfo, v
 	}
+}
+
+// resolveRetention 解析保留期（FR-6.6）：flag 优先，env TRIGGERLINK_RETENTION_DAYS 兜底，
+// 都未设时默认 30 天；负数表示显式关闭清理（返回 0）。
+// 正数但小于事件去重窗口（24h）时直接报错而非静默放宽：那会让去重窗口内的事件被删，
+// 重复投递不再被识别——属于配置错误，不该在运行时才暴露。
+func resolveRetention(flagDays int) (time.Duration, error) {
+	days := flagDays
+	if days == 0 {
+		v := strings.TrimSpace(os.Getenv("TRIGGERLINK_RETENTION_DAYS"))
+		if v == "" {
+			days = 30
+		} else {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return 0, fmt.Errorf("TRIGGERLINK_RETENTION_DAYS=%q: 需要整数天数", v)
+			}
+			days = n
+		}
+	}
+	if days < 0 {
+		return 0, nil // 显式关闭
+	}
+	if days < minRetentionDays {
+		return 0, fmt.Errorf("保留期 %d 天小于事件去重窗口（%d 天）；用负数显式关闭清理", days, minRetentionDays)
+	}
+	return time.Duration(days) * 24 * time.Hour, nil
 }
 
 // resolveDashAuth 解析 Dashboard 凭据：flag 优先，env 兜底，都为空则生成随机密码。

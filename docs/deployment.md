@@ -97,6 +97,16 @@ See the "Deploying the Platform" section of the [User Guide](user-guide.md) for 
 - Logs are structured key/value lines (Go `log/slog` text handler) on stderr; under systemd they land in journald as-is (`journalctl -u triggerlink`).
 - `-log-level debug|info|warn|error` (default `info`, or env `TRIGGERLINK_LOG_LEVEL`) controls verbosity. `debug` adds per-event routing, callback durations, and step suspend/resume lines — useful when tracing a single run, noisy under load.
 
+### Data Retention
+
+- `-retention-days` (default `30`, or env `TRIGGERLINK_RETENTION_DAYS`) bounds how much history the database keeps. A janitor goroutine cleans once at startup and hourly thereafter:
+  - terminal runs with `ended_at` older than the cutoff, cascading to their `step_runs`, `waits`, and leftover `queue_items`;
+  - events received before the cutoff, **except** those still referenced by a `Queued`/`Running` run;
+  - resolved/timed-out/cancelled waits created before the cutoff.
+- Nothing in flight is ever deleted, and a run keeps its own event snapshot, so run details survive the deletion of the triggering event.
+- The floor is 1 day: a shorter window would delete events still inside the 24h dedup window and break duplicate detection, so the platform refuses to start. Pass a negative value to disable cleanup entirely (unbounded growth — size the disk accordingly).
+- SQLite does not return freed pages to the filesystem on its own; after a large one-off cleanup, run `sqlite3 triggerlink.db 'VACUUM;'` with the platform stopped if you need the file to shrink.
+
 ### Metrics (`/metrics`)
 
 `GET /metrics` exposes Prometheus text format. The endpoint is **public** (no basic auth), following scrape convention — on a public deployment, restrict it at the reverse proxy.

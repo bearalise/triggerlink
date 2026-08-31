@@ -173,6 +173,10 @@ type Store interface {
 	ReplaceAppFunctions(ctx context.Context, appURL string, fns []RegisteredFunction) error
 	LoadRegisteredFunctions(ctx context.Context) ([]RegisteredFunction, error)
 
+	DeleteRunsBefore(ctx context.Context, cutoff time.Time) (int, error)
+	DeleteEventsBefore(ctx context.Context, cutoff time.Time) (int, error)
+	DeleteFinishedWaitsBefore(ctx context.Context, cutoff time.Time) (int, error)
+
 	SetFunctionPaused(ctx context.Context, functionID string, paused bool) error
 	IsFunctionPaused(ctx context.Context, functionID string) (bool, error)
 	PausedFunctionIDs(ctx context.Context) (map[string]bool, error)
@@ -733,6 +737,66 @@ func (s *SQLiteStore) ReleaseLease(ctx context.Context, id string, retryAt time.
 }
 
 // CompleteQueueItem 删除已完成的队列项。
+// --- 保留策略清理（FR-6.6）---
+
+// DeleteRunsBefore 删除 ended_at 早于 cutoff 的终态 run 及其从属记录：
+// step_runs / waits / 残留 queue_items 在同一事务内级联删除，返回删除的 run 数。
+// ended_at 为 NULL 的在途 run 永不删除，与保留期无关。
+func (s *SQLiteStore) DeleteRunsBefore(ctx context.Context, cutoff time.Time) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	const victims = `SELECT id FROM runs WHERE ended_at IS NOT NULL AND ended_at<?`
+	for _, table := range []string{"step_runs", "waits", "queue_items"} {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM `+table+` WHERE run_id IN (`+victims+`)`, fmtTime(cutoff)); err != nil {
+			return 0, err
+		}
+	}
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM runs WHERE ended_at IS NOT NULL AND ended_at<?`, fmtTime(cutoff))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// DeleteEventsBefore 删除 received_at 早于 cutoff 的事件，但跳过仍被在途
+// run（Queued/Running）引用的事件——那些 run 还可能重试并需要触发快照对照。
+// 终态 run 引用的事件可以删：run 自带 event_data 快照，详情页不依赖 events 表。
+func (s *SQLiteStore) DeleteEventsBefore(ctx context.Context, cutoff time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM events WHERE received_at<? AND NOT EXISTS (
+		   SELECT 1 FROM runs WHERE runs.event_id=events.id AND runs.status IN (?,?))`,
+		fmtTime(cutoff), RunQueued, RunRunning)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+// DeleteFinishedWaitsBefore 删除已解除（非 waiting）且创建于 cutoff 之前的 wait 记录。
+// 长命 run 名下的老 wait 由此清理；waiting 中的挂起永不删除。
+func (s *SQLiteStore) DeleteFinishedWaitsBefore(ctx context.Context, cutoff time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM waits WHERE status<>? AND created_at<?`, WaitWaiting, fmtTime(cutoff))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // QueueDepth 返回已到点的待执行队列项数（status=pending 且 at<=now），即积压深度。
 // 未到点的延迟项（sleep 唤醒、退避重试）不计入：它们不是"等待被执行"的积压。
 func (s *SQLiteStore) QueueDepth(ctx context.Context) (int, error) {
