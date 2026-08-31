@@ -23,6 +23,8 @@ const (
 	ResultNoSubscriber = "no_subscriber" // 没有函数订阅该事件名
 	ResultPaused       = "paused"        // 函数被暂停（FR-7.3），跳过建 run
 	ResultFiltered     = "filtered"      // 触发 match 表达式（FR-3.1）不命中
+	ResultDebounced    = "debounced"     // 并入已有的防抖窗口（FR-4.5），未新建 run
+	ResultBatched      = "batched"       // 攒进批窗口（FR-4.7），run 在 flush 时才建
 )
 
 // run 终态（RunFinished 的 status 标签）。
@@ -70,6 +72,11 @@ var (
 		Buckets: []float64{.005, .025, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300},
 	})
 
+	runsThrottled = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "triggerlink_runs_throttled_total",
+		Help: "Dispatch attempts deferred by throttle (FR-4.4); a run over the limit is counted once per deferral.",
+	})
+
 	queueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "triggerlink_queue_depth",
 		Help: "Pending queue items already due (at <= now); sampled periodically, not on scrape.",
@@ -84,12 +91,12 @@ var (
 func init() {
 	reg.MustRegister(
 		eventsReceived, eventsRouted, runsTotal, runDuration,
-		stepDuration, callbackDuration, queueDepth, waitsActive,
+		stepDuration, callbackDuration, runsThrottled, queueDepth, waitsActive,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	// 标签值预置为 0：仪表盘/告警在首次事件之前就能拿到序列（rate() 不至于无数据）。
-	for _, v := range []string{ResultRouted, ResultNoSubscriber, ResultPaused, ResultFiltered} {
+	for _, v := range []string{ResultRouted, ResultNoSubscriber, ResultPaused, ResultFiltered, ResultDebounced, ResultBatched} {
 		eventsRouted.WithLabelValues(v)
 	}
 	for _, v := range []string{StatusCompleted, StatusFailed, StatusCancelled, StatusTimeout} {
@@ -127,6 +134,9 @@ func StepObserved(op string, d time.Duration) {
 	}
 	stepDuration.WithLabelValues(op).Observe(d.Seconds())
 }
+
+// RunThrottled 记录一次因限流被推迟的派发（FR-4.4）。
+func RunThrottled() { runsThrottled.Inc() }
 
 // CallbackObserved 记录一次平台→应用回调的往返耗时。
 func CallbackObserved(d time.Duration) { callbackDuration.Observe(d.Seconds()) }

@@ -17,6 +17,9 @@ export {
   type TriggerLinkEvent,
   type CancelOnRule,
   type RunFailedEventData,
+  type DebounceOpts,
+  type ThrottleOpts,
+  type BatchOpts,
 } from "./function.js";
 export { serve, sdkVersion, type ServeOptions } from "./serve.js";
 export { StepInterrupt, type Opcode, type StepState, type OutgoingEvent } from "./execx.js";

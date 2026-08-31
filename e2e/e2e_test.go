@@ -1220,3 +1220,196 @@ func TestMetricsEndToEnd(t *testing.T) {
 		t.Fatalf("waits_active=%v, want 0", v)
 	}
 }
+
+// 防抖端到端（FR-4.5）：窗口内连发的事件合并成一个 run，handler 只跑一次，
+// 拿到的是最后一个事件；窗口关闭后的事件重新开窗。
+func TestDebounceMergesEvents(t *testing.T) {
+	var calls atomic.Int32
+	seen := make(chan string, 8)
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "index-doc", Event: "doc/changed",
+			// period 短到测试能等完，但足以覆盖三条事件的连发间隔
+			Debounce: &triggerlink.Debounce{Period: 300 * time.Millisecond, Key: "data.doc_id"},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			calls.Add(1)
+			var d struct {
+				DocID string `json:"doc_id"`
+				Rev   int    `json:"rev"`
+			}
+			json.Unmarshal(in.Event.Data, &d)
+			seen <- fmt.Sprintf("%s@%d", d.DocID, d.Rev)
+			return "ok", nil
+		}, nil)
+
+	for rev := 1; rev <= 3; rev++ {
+		st.sendEvent(t, fmt.Sprintf(`{"name":"doc/changed","data":{"doc_id":"d1","rev":%d}}`, rev))
+		time.Sleep(30 * time.Millisecond)
+	}
+	waitStatus(t, st.store, store.RunCompleted)
+
+	select {
+	case got := <-seen:
+		if got != "d1@3" {
+			t.Fatalf("handler saw %s, want d1@3 (latest event wins)", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never ran")
+	}
+	if n, err := st.store.CountRuns(context.Background()); err != nil || n != 1 {
+		t.Fatalf("runs=%d err=%v, want 1 (three events merged)", n, err)
+	}
+
+	// 窗口已随派发关闭：再发一条事件应开新窗口、产生第二个 run
+	st.sendEvent(t, `{"name":"doc/changed","data":{"doc_id":"d1","rev":4}}`)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n == 2 {
+			if calls.Load() != 2 {
+				t.Fatalf("handler calls=%d, want 2", calls.Load())
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	n, _ := st.store.CountRuns(context.Background())
+	t.Fatalf("second window did not produce a run (runs=%d)", n)
+}
+
+// 不同 debounce key 的事件不互相合并，各自独立成 run。
+func TestDebounceKeyIsolation(t *testing.T) {
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "index-doc-keys", Event: "doc/changed",
+			Debounce: &triggerlink.Debounce{Period: 200 * time.Millisecond, Key: "data.doc_id"},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) { return "ok", nil }, nil)
+
+	st.sendEvent(t, `{"name":"doc/changed","data":{"doc_id":"d1"}}`)
+	st.sendEvent(t, `{"name":"doc/changed","data":{"doc_id":"d2"}}`)
+	st.sendEvent(t, `{"name":"doc/changed","data":{"doc_id":"d1"}}`)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n == 2 {
+			total, _ := st.store.CountRuns(context.Background())
+			if total != 2 {
+				t.Fatalf("runs=%d, want exactly 2 (one per key)", total)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	n, _ := st.store.CountRuns(context.Background())
+	t.Fatalf("expected 2 completed runs, got %d runs", n)
+}
+
+// 限流端到端（FR-4.4）：窗口内只放行 limit 个 run 的首次执行，超限的不丢弃，
+// 下一窗口继续跑完。
+func TestThrottleDefersToNextWindow(t *testing.T) {
+	var running atomic.Int32
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "rate-limited", Event: "api/call",
+			Throttle: &triggerlink.Throttle{Limit: 1, Period: 500 * time.Millisecond},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			running.Add(1)
+			return "ok", nil
+		}, nil)
+
+	st.sendEvent(t, `{"name":"api/call","data":{"n":1}}`)
+	st.sendEvent(t, `{"name":"api/call","data":{"n":2}}`)
+	st.sendEvent(t, `{"name":"api/call","data":{"n":3}}`)
+
+	// 第一个窗口内只应有一个 run 完成
+	time.Sleep(250 * time.Millisecond)
+	if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n != 1 {
+		t.Fatalf("completed in first window=%d, want 1 (limit=1)", n)
+	}
+	if total, _ := st.store.CountRuns(context.Background()); total != 3 {
+		t.Fatalf("runs=%d, want 3 (over-limit runs are created, just not executed yet)", total)
+	}
+
+	// 后续窗口把剩下的跑完，一个都不丢
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n == 3 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted)
+	t.Fatalf("completed=%d after waiting, want 3 (deferred runs must eventually run)", n)
+}
+
+// 批处理端到端（FR-4.7）：攒够 max_size 触发一个 run，handler 通过 Input.Events
+// 拿到整批事件，Input.Event 是首条。
+func TestBatchingBySize(t *testing.T) {
+	got := make(chan []string, 4)
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "bulk-index", Event: "doc/changed",
+			Batch: &triggerlink.Batch{MaxSize: 3, Timeout: time.Hour},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			ids := make([]string, 0, len(in.Events))
+			for _, e := range in.Events {
+				var d struct {
+					Rev int `json:"rev"`
+				}
+				json.Unmarshal(e.Data, &d)
+				ids = append(ids, fmt.Sprintf("%d", d.Rev))
+			}
+			if len(in.Events) > 0 && in.Event.ID != in.Events[0].ID {
+				t.Errorf("ctx.event=%s, want the first batched event %s", in.Event.ID, in.Events[0].ID)
+			}
+			got <- ids
+			return "ok", nil
+		}, nil)
+
+	for rev := 1; rev <= 3; rev++ {
+		st.sendEvent(t, fmt.Sprintf(`{"name":"doc/changed","data":{"rev":%d}}`, rev))
+	}
+	waitStatus(t, st.store, store.RunCompleted)
+
+	select {
+	case batch := <-got:
+		if len(batch) != 3 || batch[0] != "1" || batch[2] != "3" {
+			t.Fatalf("handler saw %v, want [1 2 3] in arrival order", batch)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never ran")
+	}
+	if n, _ := st.store.CountRuns(context.Background()); n != 1 {
+		t.Fatalf("runs=%d, want 1 (three events → one batch run)", n)
+	}
+}
+
+// 攒不满时由 batch.timeout 兜底 flush。
+func TestBatchingByTimeout(t *testing.T) {
+	sizes := make(chan int, 4)
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "bulk-index-timeout", Event: "doc/changed",
+			Batch: &triggerlink.Batch{MaxSize: 100, Timeout: 300 * time.Millisecond},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			sizes <- len(in.Events)
+			return "ok", nil
+		}, nil)
+
+	st.sendEvent(t, `{"name":"doc/changed","data":{"rev":1}}`)
+	st.sendEvent(t, `{"name":"doc/changed","data":{"rev":2}}`)
+
+	select {
+	case n := <-sizes:
+		if n != 2 {
+			t.Fatalf("batch size=%d, want 2 (flushed by timeout, not by size)", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout flush never happened")
+	}
+	waitStatus(t, st.store, store.RunCompleted)
+}

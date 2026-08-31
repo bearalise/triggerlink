@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bearalise/triggerlink/internal/flowkey"
 	"github.com/bearalise/triggerlink/internal/ids"
 	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
@@ -133,6 +134,7 @@ type callbackRequest struct {
 		FunctionID string               `json:"function_id"`
 		Attempt    int                  `json:"attempt"`
 		Event      eventPayload         `json:"event"`
+		Events     []eventPayload       `json:"events,omitempty"` // 批触发（FR-4.7）：全部事件，Event 为其首条
 		Steps      map[string]stepState `json:"steps"`
 	} `json:"ctx"`
 }
@@ -183,6 +185,33 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		return
 	}
+	// 限流（FR-4.4）：只拦 run 的首次执行（attempt==0），重试与挂起恢复跳不再占额——
+	// 否则一个长流程会被自己的每一跳反复限流。超限不丢弃，租约延到下一窗口重投。
+	if fn.Throttle != nil && run.Attempt == 0 {
+		key := run.FunctionID + ":" + flowkey.Eval(fn.Throttle.Key, run.EventData, run.EventID)
+		allowed, retryAt, err := e.Store.ReserveThrottleSlot(ctx, key, fn.Throttle.Limit, fn.Throttle.Period, time.Now())
+		if err != nil {
+			slog.Error("throttle reserve failed", "component", "executor",
+				"run_id", run.ID, "function_id", run.FunctionID, "err", err)
+			e.Store.ReleaseLease(ctx, item.ID, time.Now().Add(e.BaseBackoff))
+			return
+		}
+		if !allowed {
+			e.Store.ReleaseLease(ctx, item.ID, retryAt)
+			metrics.RunThrottled()
+			slog.Debug("run throttled", "component", "executor", "run_id", run.ID,
+				"function_id", run.FunctionID, "throttle_key", key, "retry_at", retryAt)
+			return
+		}
+	}
+	// 防抖关窗（FR-4.5）：run 一旦开始派发就释放 (function_id, key)，后续事件重新开窗。
+	// 放在回调之前：合并窗口的语义是"到点执行时的最新快照"，而不是"执行期间还能并入"。
+	if fn.Debounce != nil {
+		if err := e.Store.DeleteDebouncePendingByRun(ctx, run.ID); err != nil {
+			slog.Warn("close debounce window failed", "component", "executor",
+				"run_id", run.ID, "function_id", run.FunctionID, "err", err)
+		}
+	}
 	// 函数级重试覆盖（FR-4.2）：未配置用全局 MaxRetries。M0 语义：尝试总数上限。
 	maxAttempts := fn.Retries
 	if maxAttempts <= 0 {
@@ -223,6 +252,18 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	req.Ctx.FunctionID = run.FunctionID
 	req.Ctx.Attempt = attempt
 	req.Ctx.Event = eventPayload{ID: run.EventID, Name: run.EventName, Data: run.EventData, TS: run.EventTS}
+	if run.Batch {
+		// 批触发的 run：event_data 存的是事件对象数组。ctx.events 给全量，
+		// ctx.event 回填首条（老 SDK 只读 ctx.event，仍能拿到一个结构正确的事件）。
+		var events []eventPayload
+		if err := json.Unmarshal(run.EventData, &events); err != nil || len(events) == 0 {
+			e.retryOrFail(ctx, item, run, attempt, maxAttempts,
+				fmt.Sprintf("decode batch events: %v", err))
+			return
+		}
+		req.Ctx.Events = events
+		req.Ctx.Event = events[0]
+	}
 	req.Ctx.Steps = map[string]stepState{}
 	for h, sr := range steps {
 		if sr.Status == store.StepCompleted {

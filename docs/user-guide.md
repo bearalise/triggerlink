@@ -381,6 +381,66 @@ fn := triggerlink.CreateFunction(
 const fn = createFunction({ id: "slow-etl", event: "etl/start", timeout: "30m" }, handler);
 ```
 
+### 5.3.8 Flow Control: Debounce / Throttle / Batch
+
+Three independent knobs on `FunctionOpts`, all optional. Durations are Go duration strings in Go (`5*time.Minute`) and either a Go duration string or a millisecond number in TypeScript.
+
+**Debounce (FR-4.5)** — collapse a burst of events into one run, keeping the **last** event:
+
+```go
+Debounce: &triggerlink.Debounce{
+    Period:  5 * time.Minute,  // each new event pushes the trigger back by another 5m
+    Key:     "data.doc_id",    // optional: one window per doc; omit for one window per function
+    Timeout: time.Hour,        // optional: never delay more than 1h past the first event
+},
+```
+
+```ts
+debounce: { period: "5m", key: "data.doc_id", timeout: "1h" }
+```
+
+The run is created as soon as the first event arrives (visible as `Queued` in the Dashboard); later events in the window replace its trigger-event snapshot rather than creating new runs. The window closes when the run is dispatched, so the next event opens a fresh one.
+
+**Throttle (FR-4.4)** — cap how many runs *start* per window:
+
+```go
+Throttle: &triggerlink.Throttle{Limit: 10, Period: time.Minute, Key: "data.tenant"},
+```
+
+```ts
+throttle: { limit: 10, period: "1m", key: "data.tenant" }
+```
+
+Over-limit runs are **delayed, never dropped**: they stay `Queued` and are retried in the next window. Only a run's *first* execution consumes quota — retries and resumptions after `sleep` / `waitForEvent` are not re-throttled, so a long multi-step run cannot starve itself.
+
+**Batching (FR-4.7)** — accumulate events and trigger one run with the whole array:
+
+```go
+Batch: &triggerlink.Batch{MaxSize: 100, Timeout: 30 * time.Second, Key: "data.tenant"},
+// handler side:
+func(ctx context.Context, in triggerlink.Input) (any, error) {
+    for _, e := range in.Events { /* the whole batch, in arrival order */ }
+    _ = in.Event // the first event of the batch
+    return nil, nil
+}
+```
+
+```ts
+batch: { maxSize: 100, timeout: "30s", key: "data.tenant" }
+// handler side: ctx.events is the whole batch; ctx.event is its first element
+```
+
+The batch flushes when it reaches `maxSize` or when `timeout` elapses since the first event, whichever comes first — `timeout` is required, otherwise a partial batch would never flush.
+
+Semantics and boundaries worth knowing:
+
+- **`key` is an expr-lang expression over `data`** (the same environment as trigger `match`), and its value groups events into independent windows/quotas. An empty, unparsable, or failing `key` collapses to one shared group — the platform prefers over-merging to silently bypassing flow control.
+- **Debounce and batching both act at the routing layer.** If a function configures both, debounce wins (documented in the manifest contract); throttle is independent of the two and can be combined with either.
+- **Paused functions (FR-7.3) open no windows at all** — pausing takes precedence over flow control.
+- **All state lives in the database**, so windows, batches, and quotas survive a restart: pending batches flush on the timeout scan after recovery, and quota counters are not reset by a restart.
+- **A malformed config is treated as unset for that function** and logged at startup; the rest of the app still registers.
+- **Debounce edge case**: if an event arrives in the instant between the run being leased for dispatch and the window closing, it still lands in the snapshot, but it can also produce a second run right after the first. The M2 platform accepts this; treat batched handlers as idempotent.
+
 ### 5.4 Error Handling Semantics
 
 - A step returning an error → the platform records a failure memo and retries with backoff (starting at 1s, exponential, capped at 30s); after **4 total attempts by default** the run is marked Failed.
@@ -598,6 +658,7 @@ On "self-registration" in step 1: it is purely a local-development convenience (
 
 - **Platform logs**: logs are structured key/value lines (Go `log/slog` text handler) written to stderr, e.g. `level=INFO msg="run completed" component=executor run_id=run_... function_id=... attempt=1 duration=1.2s`. Registration (`msg="registered function"`), reconciliation (`msg="reconciled unrouted events"`), and every retry and termination are logged — when troubleshooting, look at the platform output first. Common fields: `component`, `run_id`, `function_id`, `event_id`, `attempt`, `duration`, `err`.
 - **Data retention**: a background janitor runs hourly (and once at startup) deleting terminal runs whose `ended_at` is older than `-retention-days`, together with their steps, waits, and any leftover queue items; events older than the cutoff go too, except those still referenced by a `Queued`/`Running` run. In-flight data is never deleted, and run detail pages keep working after their triggering event is gone (each run stores its own event snapshot).
+- **Flow control at a glance**: the Dashboard function list tags each function with the flow control it has configured (`debounce` / `throttle` / `batch`); a batch-triggered run shows its whole event array on the run detail page. `triggerlink_events_routed_total{result="debounced"|"batched"}` and `triggerlink_runs_throttled_total` show the same picture over time.
 - **Metrics**: `GET /metrics` serves Prometheus text format (public path, no basic auth) — event intake, routing outcomes, terminal run counts and durations, callback latency, queue depth, and active waits. See the Metrics section of the [Deployment Guide](deployment.md) for the full series list.
 - **Turning up log detail**: start with `-log-level=debug` (or `TRIGGERLINK_LOG_LEVEL=debug`) to also see per-event routing (`msg="event routed"`), callback round-trip durations, and step-level suspend/resume lines (sleep / waitForEvent / sendEvent).
 - **Debugging "the event didn't trigger"**: check in order: ① the producer received a 200; ② the function appears as registered in the platform startup logs (did the application start before the platform?); ③ the event name matches the function's `Event` exactly; ④ whether that event ID was already sent before (idempotent deduplication).

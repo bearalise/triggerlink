@@ -217,7 +217,13 @@ export default function RunDetailPage() {
       )}
       <section>
         <h2 className="font-medium text-neutral-200 mb-1">
-          Trigger event <span className="font-mono">{run.event_name}</span>
+          {run.batch ? 'Trigger events' : 'Trigger event'}{' '}
+          <span className="font-mono">{run.event_name}</span>
+          {run.batch && (
+            <span className="ml-2 inline-block px-1.5 rounded-full bg-sky-500/10 border border-sky-900 text-sky-400 text-xs">
+              batch of {Array.isArray(run.event_data) ? run.event_data.length : '?'}
+            </span>
+          )}
         </h2>
         <JsonTree data={run.event_data} />
       </section>

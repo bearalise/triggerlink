@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bearalise/triggerlink/internal/flowkey"
 	"github.com/bearalise/triggerlink/internal/ids"
 	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
@@ -54,6 +55,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		case <-tick.C:
 			r.scanWaitTimeouts(ctx)
+			r.scanBatchTimeouts(ctx)
 		case e := <-r.Stream:
 			if err := r.route(ctx, e); err != nil {
 				slog.Error("route failed", "component", "runner", "event_id", e.ID, "err", err)
@@ -80,6 +82,25 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 		// 事件触发 match（FR-3.1）：非空且不命中（含编译/求值失败）则不为该函数建 run。
 		if !evalTriggerMatch(f.Match, e) {
 			metrics.EventRouted(metrics.ResultFiltered)
+			continue
+		}
+		// 批处理（FR-4.7）：事件先攒进窗口，攒够 max_size 即 flush 成一个 run。
+		// 与 debounce 同为路由层流控，两者都配时 debounce 优先（清单契约已注明）。
+		if f.Batch != nil && f.Debounce == nil {
+			if err := r.routeBatched(ctx, f, e); err != nil {
+				return err
+			}
+			continue
+		}
+		// 防抖（FR-4.5）：不直接建 run，交给窗口逻辑合并。
+		if f.Debounce != nil {
+			merged, err := r.routeDebounced(ctx, f, e)
+			if err != nil {
+				return err
+			}
+			if merged {
+				routed++
+			}
 			continue
 		}
 		// run ID 由 (event_id, function_id) 确定性派生：对账扫描与 stream 消费重叠导致
@@ -127,6 +148,196 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 		slog.Error("cancel_on failed", "component", "runner", "event_id", e.ID, "err", err)
 	}
 	return r.Store.MarkEventRouted(ctx, e.ID)
+}
+
+// routeBatched 处理配置了 batch 的函数（FR-4.7）：事件追加进 (function_id, key)
+// 的窗口，攒够 max_size 立刻 flush；攒不满的由 scanBatchTimeouts 按 timeout 兜底。
+func (r *Runner) routeBatched(ctx context.Context, f registry.Function, e store.Event) error {
+	key := flowkey.Eval(f.Batch.Key, e.Data, e.ID)
+	count, err := r.Store.AppendBatchEntry(ctx, f.ID, key, e)
+	if err != nil {
+		return err
+	}
+	metrics.EventRouted(metrics.ResultBatched)
+	slog.Debug("event added to batch window", "component", "runner",
+		"event_id", e.ID, "function_id", f.ID, "batch_key", key, "size", count)
+	if count >= f.Batch.MaxSize {
+		return r.flushBatch(ctx, f, key, "size")
+	}
+	return nil
+}
+
+// scanBatchTimeouts 按各函数自己的 batch.timeout 兜底 flush 攒不满的窗口。
+// 崩溃恢复也走这条路：条目全在库里，重启后由这里补 flush（最多延迟一个 tick）。
+func (r *Runner) scanBatchTimeouts(ctx context.Context) {
+	windows, err := r.Store.ListBatchWindows(ctx)
+	if err != nil {
+		slog.Error("list batch windows failed", "component", "runner", "err", err)
+		return
+	}
+	now := time.Now()
+	for _, w := range windows {
+		f, ok := r.Reg.Lookup(w.FunctionID)
+		if !ok || f.Batch == nil {
+			// 函数已下线或去掉了 batch 配置：窗口留着，等配置恢复或保留策略清理，
+			// 不擅自按未知语义 flush。
+			continue
+		}
+		if now.Before(w.FirstAt.Add(f.Batch.Timeout)) {
+			continue
+		}
+		if err := r.flushBatch(ctx, f, w.Key, "timeout"); err != nil {
+			slog.Error("flush batch on timeout failed", "component", "runner",
+				"function_id", w.FunctionID, "batch_key", w.Key, "err", err)
+		}
+	}
+}
+
+// flushBatch 把窗口内已攒的条目变成一个批 run：run.EventData = 事件对象数组，
+// EventID/EventName/EventTS 取首条（单事件字段保持可用，SDK 侧 ctx.event 即首条）。
+// 建 run、入队、删条目在一个事务内完成；flush 期间到达的新事件（seq 更大）留在窗口里。
+func (r *Runner) flushBatch(ctx context.Context, f registry.Function, key, reason string) error {
+	entries, err := r.Store.BatchEntries(ctx, f.ID, key)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	if len(entries) > f.Batch.MaxSize {
+		entries = entries[:f.Batch.MaxSize] // 一次只出一批，余下的留给下一次
+	}
+	events := make([]batchEventJSON, 0, len(entries))
+	for _, be := range entries {
+		events = append(events, batchEventJSON{
+			ID: be.Event.ID, Name: be.Event.Name, Data: be.Event.Data, TS: be.Event.TS})
+	}
+	payload, err := json.Marshal(events)
+	if err != nil {
+		return err
+	}
+	first := entries[0].Event
+	runID := ids.NewID("run")
+	now := time.Now()
+	if err := r.Store.FlushBatch(ctx, f.ID, key, entries[len(entries)-1].Seq,
+		store.Run{
+			ID:         runID,
+			FunctionID: f.ID,
+			Status:     store.RunQueued,
+			EventID:    first.ID,
+			EventName:  first.Name,
+			EventData:  payload,
+			EventTS:    first.TS,
+			Batch:      true,
+		},
+		store.QueueItem{
+			ID:         ids.NewID("qi"),
+			FunctionID: f.ID,
+			RunID:      runID,
+			Score:      now.UnixNano(),
+			At:         now,
+			Status:     store.QueuePending,
+		}); err != nil {
+		return err
+	}
+	slog.Info("batch flushed", "component", "runner", "function_id", f.ID,
+		"batch_key", key, "run_id", runID, "events", len(entries), "reason", reason)
+	return nil
+}
+
+// batchEventJSON 是批 run 快照里的单个事件形态，与协议的 ctx.events 元素同构。
+type batchEventJSON struct {
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Data json.RawMessage `json:"data"`
+	TS   time.Time       `json:"ts"`
+}
+
+// routeDebounced 处理配置了 debounce 的函数（FR-4.5）：同 (function_id, key) 的事件
+// 在 period 窗口内合并为一个 run，取尾事件。
+//
+//   - 无窗口：建 run（快照 = 本事件）+ 入队 at=now+period + 开窗，返回 created=true。
+//   - 有窗口：把 run 的事件快照换成本事件、把队列项与窗口的触发时间一起推后，run 复用。
+//
+// debounce.timeout 以窗口内首个事件为基准封顶：持续到来的事件不会把触发无限推后。
+// 窗口在 dispatch 时由 executor 删除。竞态边界：事件恰好在 dispatch 租约之后到达时，
+// 队列项已不是 pending，续窗落不到队列上——该事件仍写进了快照，但可能与下一个窗口的
+// run 紧邻产生两个 run。M2 接受这一语义（PRD 记录）。
+func (r *Runner) routeDebounced(ctx context.Context, f registry.Function, e store.Event) (bool, error) {
+	key := flowkey.Eval(f.Debounce.Key, e.Data, e.ID)
+	now := time.Now()
+
+	pending, ok, err := r.Store.GetDebouncePending(ctx, f.ID, key)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		if err := r.Store.UpdateRunEventSnapshot(ctx, pending.RunID, e); err != nil {
+			return false, err
+		}
+		at := debounceTriggerAt(now, pending.FirstAt, f.Debounce)
+		if _, err := r.Store.UpdateQueueItemAt(ctx, pending.RunID, at); err != nil {
+			return false, err
+		}
+		pending.TriggerAt = at
+		if err := r.Store.UpsertDebouncePending(ctx, pending); err != nil {
+			return false, err
+		}
+		metrics.EventRouted(metrics.ResultDebounced)
+		slog.Debug("event merged into debounce window", "component", "runner",
+			"event_id", e.ID, "function_id", f.ID, "run_id", pending.RunID,
+			"debounce_key", key, "trigger_at", at)
+		return false, nil
+	}
+
+	runID := derivedRunID(e.ID, f.ID)
+	created, err := r.Store.CreateRun(ctx, store.Run{
+		ID:         runID,
+		FunctionID: f.ID,
+		Status:     store.RunQueued,
+		EventID:    e.ID,
+		EventName:  e.Name,
+		EventData:  e.Data,
+		EventTS:    e.TS,
+	})
+	if err != nil {
+		return false, err
+	}
+	if !created {
+		// 该事件此前已为本函数建过 run（对账重放），窗口早已走完，不重复开窗。
+		return false, nil
+	}
+	at := debounceTriggerAt(now, now, f.Debounce)
+	if err := r.Store.Enqueue(ctx, store.QueueItem{
+		ID:         ids.NewID("qi"),
+		FunctionID: f.ID,
+		RunID:      runID,
+		Score:      now.UnixNano(),
+		At:         at,
+		Status:     store.QueuePending,
+	}); err != nil {
+		return false, err
+	}
+	if err := r.Store.UpsertDebouncePending(ctx, store.DebouncePending{
+		FunctionID: f.ID, Key: key, RunID: runID, FirstAt: now, TriggerAt: at,
+	}); err != nil {
+		return false, err
+	}
+	metrics.EventRouted(metrics.ResultRouted)
+	slog.Debug("debounce window opened", "component", "runner",
+		"event_id", e.ID, "function_id", f.ID, "run_id", runID, "debounce_key", key, "trigger_at", at)
+	return true, nil
+}
+
+// debounceTriggerAt 计算触发时刻：now+period，若配了 timeout 则不超过 firstAt+timeout。
+func debounceTriggerAt(now, firstAt time.Time, d *registry.Debounce) time.Time {
+	at := now.Add(d.Period)
+	if d.Timeout > 0 {
+		if max := firstAt.Add(d.Timeout); at.After(max) {
+			return max
+		}
+	}
+	return at
 }
 
 // resumeWaits 处理到达事件对 waitForEvent 挂起的恢复：命中的 wait 补写 completed memo

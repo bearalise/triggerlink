@@ -42,6 +42,7 @@ type callbackRequest struct {
 		FunctionID string                     `json:"function_id"`
 		Attempt    int                        `json:"attempt"`
 		Event      Event                      `json:"event"`
+		Events     []Event                    `json:"events,omitempty"` // 批触发（FR-4.7）：整批事件，Event 为首条
 		Steps      map[string]execx.StepState `json:"steps"`
 	} `json:"ctx"`
 }
@@ -62,14 +63,32 @@ func (h *serveHandler) handleManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	type debounceInfo struct {
+		Period  string `json:"period"`
+		Key     string `json:"key,omitempty"`
+		Timeout string `json:"timeout,omitempty"`
+	}
+	type throttleInfo struct {
+		Limit  int    `json:"limit"`
+		Period string `json:"period"`
+		Key    string `json:"key,omitempty"`
+	}
+	type batchInfo struct {
+		MaxSize int    `json:"max_size"`
+		Timeout string `json:"timeout"`
+		Key     string `json:"key,omitempty"`
+	}
 	type fnInfo struct {
-		ID       string     `json:"id"`
-		Event    string     `json:"event"`
-		Match    string     `json:"match,omitempty"`
-		Cron     string     `json:"cron,omitempty"`
-		Retries  int        `json:"retries"`
-		CancelOn []CancelOn `json:"cancel_on,omitempty"`
-		Timeout  string     `json:"timeout,omitempty"`
+		ID       string        `json:"id"`
+		Event    string        `json:"event"`
+		Match    string        `json:"match,omitempty"`
+		Cron     string        `json:"cron,omitempty"`
+		Retries  int           `json:"retries"`
+		CancelOn []CancelOn    `json:"cancel_on,omitempty"`
+		Timeout  string        `json:"timeout,omitempty"`
+		Debounce *debounceInfo `json:"debounce,omitempty"`
+		Throttle *throttleInfo `json:"throttle,omitempty"`
+		Batch    *batchInfo    `json:"batch,omitempty"`
 	}
 	fns := make([]fnInfo, 0, len(h.byID))
 	for _, f := range h.byID {
@@ -79,6 +98,18 @@ func (h *serveHandler) handleManifest(w http.ResponseWriter, r *http.Request) {
 		}
 		if f.opts.Timeout > 0 {
 			info.Timeout = f.opts.Timeout.String()
+		}
+		if d := f.opts.Debounce; d != nil {
+			info.Debounce = &debounceInfo{Period: d.Period.String(), Key: d.Key}
+			if d.Timeout > 0 {
+				info.Debounce.Timeout = d.Timeout.String()
+			}
+		}
+		if t := f.opts.Throttle; t != nil {
+			info.Throttle = &throttleInfo{Limit: t.Limit, Period: t.Period.String(), Key: t.Key}
+		}
+		if b := f.opts.Batch; b != nil {
+			info.Batch = &batchInfo{MaxSize: b.MaxSize, Timeout: b.Timeout.String(), Key: b.Key}
 		}
 		fns = append(fns, info)
 	}
@@ -125,7 +156,7 @@ func (h *serveHandler) handleExec(w http.ResponseWriter, r *http.Request) {
 				runErr = fmt.Errorf("panic: %v\n%s", rv, debug.Stack())
 			}
 		}()
-		output, runErr = fn.handler(ctx, Input{Event: req.Ctx.Event})
+		output, runErr = fn.handler(ctx, Input{Event: req.Ctx.Event, Events: req.Ctx.Events})
 	}()
 
 	w.Header().Set("Content-Type", "application/json")

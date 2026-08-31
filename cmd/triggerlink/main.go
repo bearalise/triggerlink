@@ -133,7 +133,13 @@ func main() {
 				b, _ := json.Marshal(f.CancelOn)
 				cancelOn = string(b)
 			}
-			rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Match: f.Match, Cron: f.Cron, Retries: f.Retries, CancelOn: cancelOn, Timeout: f.Timeout})
+			rfns = append(rfns, store.RegisteredFunction{
+				ID: f.ID, AppURL: appURL, Event: f.Event, Match: f.Match, Cron: f.Cron,
+				Retries: f.Retries, CancelOn: cancelOn, Timeout: f.Timeout,
+				Debounce: marshalFlowControl(f.ID, "debounce", f.Debounce),
+				Throttle: marshalFlowControl(f.ID, "throttle", f.Throttle),
+				Batch:    marshalFlowControl(f.ID, "batch", f.Batch),
+			})
 		}
 		return st.ReplaceAppFunctions(ctx, appURL, rfns)
 	}
@@ -148,8 +154,13 @@ func main() {
 					slog.Warn("decode cancel_on", "function_id", rf.ID, "err", err)
 				}
 			}
-			byApp[rf.AppURL] = append(byApp[rf.AppURL],
-				registry.Function{ID: rf.ID, Event: rf.Event, Match: rf.Match, Cron: rf.Cron, Retries: rf.Retries, CancelOn: cancelOn, Timeout: rf.Timeout, AppURL: rf.AppURL})
+			byApp[rf.AppURL] = append(byApp[rf.AppURL], registry.Function{
+				ID: rf.ID, Event: rf.Event, Match: rf.Match, Cron: rf.Cron, Retries: rf.Retries,
+				CancelOn: cancelOn, Timeout: rf.Timeout, AppURL: rf.AppURL,
+				Debounce: unmarshalFlowControl[registry.Debounce](rf.ID, "debounce", rf.Debounce),
+				Throttle: unmarshalFlowControl[registry.Throttle](rf.ID, "throttle", rf.Throttle),
+				Batch:    unmarshalFlowControl[registry.Batch](rf.ID, "batch", rf.Batch),
+			})
 		}
 		for appURL, fns := range byApp {
 			reg.Sync(appURL, fns)
@@ -260,6 +271,33 @@ func parseLogLevel(flagVal string) (slog.Level, string) {
 	default:
 		return slog.LevelInfo, v
 	}
+}
+
+// marshalFlowControl / unmarshalFlowControl 在注册表的流控配置与其落库 JSON 之间
+// 转换（FR-4.4/4.5/4.7）。两侧用同一套 Marshal/UnmarshalJSON，落库形态与清单形态一致。
+// 转换失败只记日志并视为未配置：一条坏记录不该让平台起不来或整个 app 恢复不了。
+func marshalFlowControl[T any](functionID, field string, v *T) string {
+	if v == nil {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		slog.Warn("encode flow-control config", "function_id", functionID, "field", field, "err", err)
+		return ""
+	}
+	return string(b)
+}
+
+func unmarshalFlowControl[T any](functionID, field, raw string) *T {
+	if raw == "" {
+		return nil
+	}
+	var v T
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		slog.Warn("decode flow-control config", "function_id", functionID, "field", field, "err", err)
+		return nil
+	}
+	return &v
 }
 
 // resolveRetention 解析保留期（FR-6.6）：flag 优先，env TRIGGERLINK_RETENTION_DAYS 兜底，

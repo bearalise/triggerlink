@@ -35,16 +35,26 @@ type Function struct {
 	Retries  int           `json:"retries"`
 	CancelOn []CancelRule  `json:"cancel_on,omitempty"`
 	Timeout  time.Duration `json:"-"`
-	AppURL   string        `json:"-"`
+	// 流控配置（FR-4.4/4.5/4.7），nil 表示未配置。时长字段在清单 JSON 中是 Go duration
+	// 字符串，故与 Timeout 同样不参与默认解码（见 UnmarshalJSON）。
+	Debounce *Debounce `json:"debounce,omitempty"`
+	Throttle *Throttle `json:"throttle,omitempty"`
+	Batch    *Batch    `json:"batch,omitempty"`
+	AppURL   string    `json:"-"`
 }
 
-// UnmarshalJSON 解析清单 JSON 的 timeout 字段（Go duration 字符串，如 "5m"）；
-// 非法值记日志并视为 0（不限制），不使整个内省失败。
+// UnmarshalJSON 解析清单 JSON 中需要额外处理的字段：timeout（Go duration 字符串，
+// 如 "5m"）与三个流控配置（debounce/throttle/batch）。
+// 单个字段非法只记日志并视为未配置，不使整个内省失败——一个函数的配置笔误不该让
+// 整个应用注册不上。
 func (f *Function) UnmarshalJSON(b []byte) error {
 	type alias Function // 避免递归调用 UnmarshalJSON
 	var raw struct {
 		alias
-		Timeout string `json:"timeout"`
+		Timeout  string          `json:"timeout"`
+		Debounce json.RawMessage `json:"debounce"`
+		Throttle json.RawMessage `json:"throttle"`
+		Batch    json.RawMessage `json:"batch"`
 	}
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return err
@@ -58,7 +68,24 @@ func (f *Function) UnmarshalJSON(b []byte) error {
 			f.Timeout = d
 		}
 	}
+	f.Debounce = decodeFlowControl[Debounce](raw.Debounce, raw.ID, "debounce")
+	f.Throttle = decodeFlowControl[Throttle](raw.Throttle, raw.ID, "throttle")
+	f.Batch = decodeFlowControl[Batch](raw.Batch, raw.ID, "batch")
 	return nil
+}
+
+// decodeFlowControl 解码一个流控配置；缺省/null 返回 nil，非法值记日志后返回 nil。
+func decodeFlowControl[T any](raw json.RawMessage, functionID, field string) *T {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var v T
+	if err := json.Unmarshal(raw, &v); err != nil {
+		slog.Warn("invalid function flow-control config, ignored",
+			"component", "registry", "function_id", functionID, "field", field, "err", err)
+		return nil
+	}
+	return &v
 }
 
 type manifest struct {

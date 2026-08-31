@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -66,6 +67,9 @@ type Run struct {
 	Attempt    int
 	CreatedAt  time.Time
 	EndedAt    *time.Time
+	// Batch 为真表示这是批触发的 run（FR-4.7）：EventData 是事件对象数组
+	// [{"id","name","data","ts"},...]，EventID/EventName/EventTS 取首条。
+	Batch bool
 }
 
 // StepResult 是 memo 核心：以 (run_id, step_hash) 为键的 step 执行记录。
@@ -117,6 +121,36 @@ type RegisteredFunction struct {
 	Retries  int
 	CancelOn string
 	Timeout  time.Duration
+	// 流控配置（FR-4.4/4.5/4.7）的 JSON 序列化形态，空串表示未配置。
+	// 存原样 JSON 而非拆列：清单形态与落库形态一致，加字段无需再迁移。
+	Debounce string
+	Throttle string
+	Batch    string
+}
+
+// BatchWindow 是一个开着的批窗口（FR-4.7）：同 (FunctionID, Key) 的事件攒在
+// batch_entries 里，FirstAt 是窗口内最早一条的时刻，用于 batch.timeout 兜底 flush。
+type BatchWindow struct {
+	FunctionID string
+	Key        string
+	FirstAt    time.Time
+}
+
+// BatchEntry 是批窗口里的一条事件。Seq 单调递增，决定批内顺序。
+type BatchEntry struct {
+	Seq   int64
+	Event Event
+}
+
+// DebouncePending 是一个开着的防抖窗口（FR-4.5）：同 (FunctionID, Key) 的后续事件
+// 并入 RunID 这个 run，并把触发时间推后到 TriggerAt。FirstAt 是窗口内首个事件的时刻，
+// 用于给 debounce.timeout 封顶。窗口在 run 被派发时删除，下个事件重新开窗。
+type DebouncePending struct {
+	FunctionID string
+	Key        string
+	RunID      string
+	FirstAt    time.Time
+	TriggerAt  time.Time
 }
 
 // QueueItem 是队列中的待执行单元；score 决定 FIFO 顺序，at 是"不早于"时间（退避用）。
@@ -162,7 +196,21 @@ type Store interface {
 	ListStepRecords(ctx context.Context, runID string) ([]StepRecord, error)
 	FunctionStats24h(ctx context.Context, since time.Time) (map[string]FunctionStat, error)
 
+	UpdateRunEventSnapshot(ctx context.Context, runID string, e Event) error
+	AppendBatchEntry(ctx context.Context, functionID, key string, e Event) (int, error)
+	BatchEntries(ctx context.Context, functionID, key string) ([]BatchEntry, error)
+	ListBatchWindows(ctx context.Context) ([]BatchWindow, error)
+	FlushBatch(ctx context.Context, functionID, key string, upToSeq int64, run Run, item QueueItem) error
+
+	GetDebouncePending(ctx context.Context, functionID, key string) (DebouncePending, bool, error)
+	UpsertDebouncePending(ctx context.Context, p DebouncePending) error
+	DeleteDebouncePendingByRun(ctx context.Context, runID string) error
+
+	ReserveThrottleSlot(ctx context.Context, key string, limit int, period time.Duration, now time.Time) (bool, time.Time, error)
+	DeleteThrottleStateBefore(ctx context.Context, cutoff time.Time) (int, error)
+
 	Enqueue(ctx context.Context, item QueueItem) error
+	UpdateQueueItemAt(ctx context.Context, runID string, at time.Time) (int, error)
 	LeaseBatch(ctx context.Context, now time.Time, leaseDur time.Duration, limit int) ([]QueueItem, error)
 	QueueDepth(ctx context.Context) (int, error)
 	ActiveWaitCount(ctx context.Context) (int, error)
@@ -277,6 +325,37 @@ CREATE TABLE IF NOT EXISTS waits (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_waits_run_step ON waits(run_id, step_hash);
 CREATE INDEX IF NOT EXISTS idx_waits_event ON waits(status, event_name);
+CREATE TABLE IF NOT EXISTS debounce_pending (
+  function_id   TEXT NOT NULL,
+  debounce_key  TEXT NOT NULL,
+  run_id        TEXT NOT NULL,
+  first_at      TEXT NOT NULL,
+  trigger_at    TEXT NOT NULL,
+  PRIMARY KEY (function_id, debounce_key)
+);
+CREATE INDEX IF NOT EXISTS idx_debounce_run ON debounce_pending(run_id);
+CREATE TABLE IF NOT EXISTS batch_windows (
+  function_id TEXT NOT NULL,
+  batch_key   TEXT NOT NULL,
+  first_at    TEXT NOT NULL,
+  PRIMARY KEY (function_id, batch_key)
+);
+CREATE TABLE IF NOT EXISTS batch_entries (
+  function_id TEXT NOT NULL,
+  batch_key   TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  event_id    TEXT NOT NULL,
+  event_name  TEXT NOT NULL,
+  event_data  TEXT NOT NULL,
+  event_ts    TEXT NOT NULL,
+  added_at    TEXT NOT NULL,
+  PRIMARY KEY (function_id, batch_key, seq)
+);
+CREATE TABLE IF NOT EXISTS throttle_state (
+  constraint_key TEXT PRIMARY KEY,
+  window_start   TEXT NOT NULL,
+  count          INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS paused_functions (
   function_id TEXT PRIMARY KEY,
   paused_at   TEXT NOT NULL
@@ -304,7 +383,16 @@ CREATE TABLE IF NOT EXISTS webhooks (
 	if err := ensureColumn(db, "functions", "cron", "TEXT"); err != nil {
 		return err
 	}
-	return ensureColumn(db, "functions", "timeout", "TEXT")
+	if err := ensureColumn(db, "functions", "timeout", "TEXT"); err != nil {
+		return err
+	}
+	for _, col := range []string{"debounce", "throttle", "batch"} {
+		if err := ensureColumn(db, "functions", col, "TEXT"); err != nil {
+			return err
+		}
+	}
+	// runs.batch 标记批触发的 run（FR-4.7）：其 event_data 是事件数组而非单个事件的 data。
+	return ensureColumn(db, "runs", "batch", "INTEGER NOT NULL DEFAULT 0")
 }
 
 // ensureColumn 给已存在的表补列（SQLite 无 ADD COLUMN IF NOT EXISTS，先查 PRAGMA）。
@@ -385,9 +473,10 @@ func (s *SQLiteStore) UnroutedEvents(ctx context.Context) ([]Event, error) {
 // 返回 created=false——路由的"对账扫描与 stream 消费重叠"双路由竞态靠它兜底（调用方不得再入队）。
 func (s *SQLiteStore) CreateRun(ctx context.Context, r Run) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO runs (id, function_id, status, event_id, event_name, event_data, event_ts, created_at)
-		 VALUES (?,?,?,?,?,?,?,?)`,
-		r.ID, r.FunctionID, RunQueued, r.EventID, r.EventName, string(r.EventData), fmtTime(r.EventTS), fmtTime(time.Now()))
+		`INSERT OR IGNORE INTO runs (id, function_id, status, event_id, event_name, event_data, event_ts, batch, created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.FunctionID, RunQueued, r.EventID, r.EventName, string(r.EventData), fmtTime(r.EventTS),
+		r.Batch, fmtTime(time.Now()))
 	if err != nil {
 		return false, err
 	}
@@ -401,9 +490,10 @@ func (s *SQLiteStore) GetRun(ctx context.Context, id string) (Run, error) {
 	var edata, ets, cat string
 	var output, errStr, eat sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, function_id, status, event_id, event_name, event_data, event_ts, output, error, attempt, created_at, ended_at
+		`SELECT id, function_id, status, event_id, event_name, event_data, event_ts, output, error, attempt, batch, created_at, ended_at
 		 FROM runs WHERE id=?`, id).
-		Scan(&r.ID, &r.FunctionID, &r.Status, &r.EventID, &r.EventName, &edata, &ets, &output, &errStr, &r.Attempt, &cat, &eat)
+		Scan(&r.ID, &r.FunctionID, &r.Status, &r.EventID, &r.EventName, &edata, &ets, &output, &errStr, &r.Attempt,
+			&r.Batch, &cat, &eat)
 	if err != nil {
 		return Run{}, err
 	}
@@ -737,6 +827,265 @@ func (s *SQLiteStore) ReleaseLease(ctx context.Context, id string, retryAt time.
 }
 
 // CompleteQueueItem 删除已完成的队列项。
+// --- 防抖窗口（FR-4.5）---
+
+// UpdateRunEventSnapshot 把 run 的触发事件快照替换为最新事件（防抖取尾事件语义）。
+// 只改快照，不动状态/尝试次数：run 尚未开始执行，回调时拿到的就是最后一个事件。
+func (s *SQLiteStore) UpdateRunEventSnapshot(ctx context.Context, runID string, e Event) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE runs SET event_id=?, event_name=?, event_data=?, event_ts=? WHERE id=?`,
+		e.ID, e.Name, string(e.Data), fmtTime(e.TS), runID)
+	return err
+}
+
+// GetDebouncePending 查 (function_id, key) 上是否有开着的窗口。
+func (s *SQLiteStore) GetDebouncePending(ctx context.Context, functionID, key string) (DebouncePending, bool, error) {
+	var p DebouncePending
+	var firstAt, triggerAt string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT function_id, debounce_key, run_id, first_at, trigger_at
+		 FROM debounce_pending WHERE function_id=? AND debounce_key=?`, functionID, key).
+		Scan(&p.FunctionID, &p.Key, &p.RunID, &firstAt, &triggerAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DebouncePending{}, false, nil
+	}
+	if err != nil {
+		return DebouncePending{}, false, err
+	}
+	if p.FirstAt, err = parseTime(firstAt); err != nil {
+		return DebouncePending{}, false, err
+	}
+	if p.TriggerAt, err = parseTime(triggerAt); err != nil {
+		return DebouncePending{}, false, err
+	}
+	return p, true, nil
+}
+
+// UpsertDebouncePending 开窗或续窗：已存在则只推后 trigger_at，run_id 与 first_at
+// 保持首个事件时的值（run 复用，timeout 封顶以首个事件为基准）。
+func (s *SQLiteStore) UpsertDebouncePending(ctx context.Context, p DebouncePending) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO debounce_pending (function_id, debounce_key, run_id, first_at, trigger_at)
+		 VALUES (?,?,?,?,?)
+		 ON CONFLICT(function_id, debounce_key) DO UPDATE SET trigger_at=excluded.trigger_at`,
+		p.FunctionID, p.Key, p.RunID, fmtTime(p.FirstAt), fmtTime(p.TriggerAt))
+	return err
+}
+
+// DeleteDebouncePendingByRun 关窗：run 被派发时调用，键随即释放，下个事件重新开窗。
+func (s *SQLiteStore) DeleteDebouncePendingByRun(ctx context.Context, runID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM debounce_pending WHERE run_id=?`, runID)
+	return err
+}
+
+// UpdateQueueItemAt 把某个 run 仍处于 pending 的队列项推后到 at，返回改动行数。
+// 只动 pending：已租赁的项说明 dispatch 正在进行，此时推后无意义（返回 0，调用方据此
+// 知道这次续窗没落到队列上）。
+func (s *SQLiteStore) UpdateQueueItemAt(ctx context.Context, runID string, at time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE queue_items SET at=? WHERE run_id=? AND status=?`, fmtTime(at), runID, QueuePending)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+// --- 批处理窗口（FR-4.7）---
+
+// AppendBatchEntry 把事件追加进 (function_id, key) 的批窗口，返回追加后的条目总数。
+// 事务内完成"开窗（若无）+ 取下一个 seq + 落条目"，seq 决定批内顺序。
+func (s *SQLiteStore) AppendBatchEntry(ctx context.Context, functionID, key string, e Event) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	now := fmtTime(time.Now())
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO batch_windows (function_id, batch_key, first_at) VALUES (?,?,?)
+		 ON CONFLICT(function_id, batch_key) DO NOTHING`, functionID, key, now); err != nil {
+		return 0, err
+	}
+	var nextSeq int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(seq), 0) + 1 FROM batch_entries WHERE function_id=? AND batch_key=?`,
+		functionID, key).Scan(&nextSeq); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO batch_entries (function_id, batch_key, seq, event_id, event_name, event_data, event_ts, added_at)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		functionID, key, nextSeq, e.ID, e.Name, string(e.Data), fmtTime(e.TS), now); err != nil {
+		return 0, err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM batch_entries WHERE function_id=? AND batch_key=?`,
+		functionID, key).Scan(&count); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// BatchEntries 按 seq 升序返回窗口内的全部条目（批内顺序 = 事件到达顺序）。
+func (s *SQLiteStore) BatchEntries(ctx context.Context, functionID, key string) ([]BatchEntry, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT seq, event_id, event_name, event_data, event_ts
+		 FROM batch_entries WHERE function_id=? AND batch_key=? ORDER BY seq`, functionID, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BatchEntry
+	for rows.Next() {
+		var be BatchEntry
+		var data, ts string
+		if err := rows.Scan(&be.Seq, &be.Event.ID, &be.Event.Name, &data, &ts); err != nil {
+			return nil, err
+		}
+		be.Event.Data = json.RawMessage(data)
+		if be.Event.TS, err = parseTime(ts); err != nil {
+			return nil, err
+		}
+		out = append(out, be)
+	}
+	return out, rows.Err()
+}
+
+// ListBatchWindows 返回全部开着的批窗口。超时 flush 的判定按函数各自的 timeout，
+// 故这里不带条件——开着的窗口数与"有事件在攒"的 (函数, key) 数同阶，很小。
+func (s *SQLiteStore) ListBatchWindows(ctx context.Context) ([]BatchWindow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT function_id, batch_key, first_at FROM batch_windows ORDER BY first_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BatchWindow
+	for rows.Next() {
+		var w BatchWindow
+		var firstAt string
+		if err := rows.Scan(&w.FunctionID, &w.Key, &firstAt); err != nil {
+			return nil, err
+		}
+		if w.FirstAt, err = parseTime(firstAt); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// FlushBatch 在一个事务里落地一次 flush：建 run、入队、删掉 seq<=upToSeq 的条目。
+// 只删读取过的那些条目：flush 期间到达的新事件（seq 更大）留在窗口里继续攒，
+// 窗口的 first_at 顺延到剩余条目中最早的一条；没有剩余则关窗。
+func (s *SQLiteStore) FlushBatch(ctx context.Context, functionID, key string, upToSeq int64, run Run, item QueueItem) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO runs (id, function_id, status, event_id, event_name, event_data, event_ts, batch, created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		run.ID, run.FunctionID, RunQueued, run.EventID, run.EventName, string(run.EventData),
+		fmtTime(run.EventTS), true, fmtTime(time.Now())); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO queue_items (id, function_id, run_id, score, at, status, created_at) VALUES (?,?,?,?,?,?,?)`,
+		item.ID, item.FunctionID, item.RunID, item.Score, fmtTime(item.At), QueuePending, fmtTime(time.Now())); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM batch_entries WHERE function_id=? AND batch_key=? AND seq<=?`,
+		functionID, key, upToSeq); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE batch_windows SET first_at=COALESCE(
+		   (SELECT MIN(added_at) FROM batch_entries WHERE function_id=? AND batch_key=?), first_at)
+		 WHERE function_id=? AND batch_key=?`,
+		functionID, key, functionID, key); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM batch_windows WHERE function_id=? AND batch_key=?
+		 AND NOT EXISTS (SELECT 1 FROM batch_entries WHERE function_id=? AND batch_key=?)`,
+		functionID, key, functionID, key); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// --- 限流配额（FR-4.4）---
+
+// ReserveThrottleSlot 在 key 的当前窗口里占一个名额。事务内读改写：
+//   - 无记录或窗口已过期 → 以 now 开新窗口，count=1，放行。
+//   - 窗口内 count < limit → count+1，放行。
+//   - 窗口内已满 → 拒绝，第二个返回值是下一窗口开始时刻（调用方据此延迟重试）。
+//
+// 名额只在 run 首次执行时占用，不随重试/恢复跳重复扣减（由调用方判断）。
+func (s *SQLiteStore) ReserveThrottleSlot(ctx context.Context, key string, limit int, period time.Duration, now time.Time) (bool, time.Time, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	defer tx.Rollback()
+
+	var windowStart string
+	var count int
+	err = tx.QueryRowContext(ctx,
+		`SELECT window_start, count FROM throttle_state WHERE constraint_key=?`, key).
+		Scan(&windowStart, &count)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		windowStart, count = "", 0
+	case err != nil:
+		return false, time.Time{}, err
+	}
+
+	start := time.Time{}
+	if windowStart != "" {
+		if start, err = parseTime(windowStart); err != nil {
+			return false, time.Time{}, err
+		}
+	}
+	expired := windowStart == "" || !now.Before(start.Add(period))
+	if !expired && count >= limit {
+		return false, start.Add(period), nil
+	}
+	if expired {
+		start, count = now, 0
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO throttle_state (constraint_key, window_start, count) VALUES (?,?,?)
+		 ON CONFLICT(constraint_key) DO UPDATE SET window_start=excluded.window_start, count=excluded.count`,
+		key, fmtTime(start), count+1); err != nil {
+		return false, time.Time{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, time.Time{}, err
+	}
+	return true, time.Time{}, nil
+}
+
+// DeleteThrottleStateBefore 删除窗口起点早于 cutoff 的配额记录（高基数 key 的清理）。
+// 早于 cutoff 的窗口必然已过期，下次占额会重新开窗，删掉不影响语义。
+func (s *SQLiteStore) DeleteThrottleStateBefore(ctx context.Context, cutoff time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM throttle_state WHERE window_start<?`, fmtTime(cutoff))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // --- 保留策略清理（FR-6.6）---
 
 // DeleteRunsBefore 删除 ended_at 早于 cutoff 的终态 run 及其从属记录：
@@ -850,11 +1199,15 @@ func (s *SQLiteStore) ReplaceAppFunctions(ctx context.Context, appURL string, fn
 			timeout = f.Timeout.String()
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO functions (id, app_url, event, match, cron, retries, cancel_on, timeout, updated_at) VALUES (?,?,?,?,?,?,?,?,?)
+			`INSERT INTO functions (id, app_url, event, match, cron, retries, cancel_on, timeout, debounce, throttle, batch, updated_at)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET
 			   app_url=excluded.app_url, event=excluded.event, match=excluded.match, cron=excluded.cron,
-			   retries=excluded.retries, cancel_on=excluded.cancel_on, timeout=excluded.timeout, updated_at=excluded.updated_at`,
-			f.ID, appURL, f.Event, f.Match, f.Cron, f.Retries, f.CancelOn, timeout, now); err != nil {
+			   retries=excluded.retries, cancel_on=excluded.cancel_on, timeout=excluded.timeout,
+			   debounce=excluded.debounce, throttle=excluded.throttle, batch=excluded.batch,
+			   updated_at=excluded.updated_at`,
+			f.ID, appURL, f.Event, f.Match, f.Cron, f.Retries, f.CancelOn, timeout,
+			f.Debounce, f.Throttle, f.Batch, now); err != nil {
 			return err
 		}
 	}
@@ -864,7 +1217,8 @@ func (s *SQLiteStore) ReplaceAppFunctions(ctx context.Context, appURL string, fn
 // LoadRegisteredFunctions 返回全部持久化的函数注册记录（启动恢复用），按 app_url, id 排序。
 func (s *SQLiteStore) LoadRegisteredFunctions(ctx context.Context) ([]RegisteredFunction, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, app_url, event, COALESCE(match, ''), COALESCE(cron, ''), retries, COALESCE(cancel_on, ''), COALESCE(timeout, '')
+		`SELECT id, app_url, event, COALESCE(match, ''), COALESCE(cron, ''), retries, COALESCE(cancel_on, ''), COALESCE(timeout, ''),
+		        COALESCE(debounce, ''), COALESCE(throttle, ''), COALESCE(batch, '')
 		 FROM functions ORDER BY app_url, id`)
 	if err != nil {
 		return nil, err
@@ -874,7 +1228,8 @@ func (s *SQLiteStore) LoadRegisteredFunctions(ctx context.Context) ([]Registered
 	for rows.Next() {
 		var f RegisteredFunction
 		var timeout string
-		if err := rows.Scan(&f.ID, &f.AppURL, &f.Event, &f.Match, &f.Cron, &f.Retries, &f.CancelOn, &timeout); err != nil {
+		if err := rows.Scan(&f.ID, &f.AppURL, &f.Event, &f.Match, &f.Cron, &f.Retries, &f.CancelOn, &timeout,
+			&f.Debounce, &f.Throttle, &f.Batch); err != nil {
 			return nil, err
 		}
 		if timeout != "" {

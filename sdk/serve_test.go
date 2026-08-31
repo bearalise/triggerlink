@@ -362,3 +362,53 @@ func TestUserPanicBecomesRunError(t *testing.T) {
 		t.Fatalf("error=%v", out["error"])
 	}
 }
+
+// 流控配置随 manifest 上报：时长为 Go duration 字符串，字段名与协议一致
+// （max_size 下划线），未配置的函数不出现这三个键。
+func TestManifestFlowControl(t *testing.T) {
+	fn := CreateFunction(FunctionOpts{
+		ID: "index-doc", Event: "doc/changed",
+		Debounce: &Debounce{Period: 5 * time.Minute, Key: "data.doc_id", Timeout: time.Hour},
+		Throttle: &Throttle{Limit: 10, Period: time.Minute},
+		Batch:    &Batch{MaxSize: 100, Timeout: 30 * time.Second, Key: "data.tenant"},
+	}, func(ctx context.Context, in Input) (any, error) { return nil, nil })
+	plain := CreateFunction(FunctionOpts{ID: "plain", Event: "x/y"},
+		func(ctx context.Context, in Input) (any, error) { return nil, nil })
+	h := Serve(testClient(), fn, plain)
+	req := httptest.NewRequest(http.MethodGet, "/api/triggerlink", nil)
+	req.Header.Set("X-TriggerLink-Signature", signHeader("k", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	var m struct {
+		Functions []struct {
+			ID       string          `json:"id"`
+			Debounce json.RawMessage `json:"debounce"`
+			Throttle json.RawMessage `json:"throttle"`
+			Batch    json.RawMessage `json:"batch"`
+		} `json:"functions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]struct {
+		debounce, throttle, batch string
+	}{}
+	for _, f := range m.Functions {
+		byID[f.ID] = struct{ debounce, throttle, batch string }{
+			string(f.Debounce), string(f.Throttle), string(f.Batch)}
+	}
+	got := byID["index-doc"]
+	if got.debounce != `{"period":"5m0s","key":"data.doc_id","timeout":"1h0m0s"}` {
+		t.Fatalf("debounce=%s", got.debounce)
+	}
+	if got.throttle != `{"limit":10,"period":"1m0s"}` {
+		t.Fatalf("throttle=%s", got.throttle)
+	}
+	if got.batch != `{"max_size":100,"timeout":"30s","key":"data.tenant"}` {
+		t.Fatalf("batch=%s", got.batch)
+	}
+	if p := byID["plain"]; p.debounce != "" || p.throttle != "" || p.batch != "" {
+		t.Fatalf("unconfigured function must omit flow control: %+v", p)
+	}
+}

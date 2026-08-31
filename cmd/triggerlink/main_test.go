@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/bearalise/triggerlink/internal/registry"
 )
 
 func TestResolveRetention(t *testing.T) {
@@ -64,5 +66,29 @@ func TestParseLogLevel(t *testing.T) {
 	t.Setenv("TRIGGERLINK_LOG_LEVEL", "debug")
 	if lvl, _ := parseLogLevel(""); lvl.String() != "DEBUG" {
 		t.Fatalf("env fallback: got %v", lvl)
+	}
+}
+
+// 流控配置在注册表形态与落库 JSON 之间往返恒等；nil/空串互为对应；坏 JSON 视为未配置。
+func TestFlowControlMarshalRoundTrip(t *testing.T) {
+	in := &registry.Debounce{Period: 90 * time.Second, Key: "data.k", Timeout: time.Hour}
+	raw := marshalFlowControl("f1", "debounce", in)
+	if raw != `{"period":"1m30s","key":"data.k","timeout":"1h0m0s"}` {
+		t.Fatalf("marshal=%s", raw)
+	}
+	out := unmarshalFlowControl[registry.Debounce]("f1", "debounce", raw)
+	if out == nil || *out != *in {
+		t.Fatalf("round trip: got %+v, want %+v", out, in)
+	}
+
+	if got := marshalFlowControl[registry.Throttle]("f1", "throttle", nil); got != "" {
+		t.Fatalf("nil must marshal to empty string, got %q", got)
+	}
+	if got := unmarshalFlowControl[registry.Throttle]("f1", "throttle", ""); got != nil {
+		t.Fatalf("empty string must unmarshal to nil, got %+v", got)
+	}
+	// 坏记录不该让恢复失败，只是该配置视为未设置
+	if got := unmarshalFlowControl[registry.Batch]("f1", "batch", `{"max_size":0}`); got != nil {
+		t.Fatalf("invalid stored config must yield nil, got %+v", got)
 	}
 }

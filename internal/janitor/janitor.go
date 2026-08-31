@@ -16,7 +16,13 @@ type Store interface {
 	DeleteRunsBefore(ctx context.Context, cutoff time.Time) (int, error)
 	DeleteEventsBefore(ctx context.Context, cutoff time.Time) (int, error)
 	DeleteFinishedWaitsBefore(ctx context.Context, cutoff time.Time) (int, error)
+	DeleteThrottleStateBefore(ctx context.Context, cutoff time.Time) (int, error)
 }
+
+// staleThrottleAge 是限流配额记录的清理阈值：窗口起点早于此的记录必然已过期
+// （最长的合理窗口也远短于一天），删掉只是回收行，不影响限流语义。
+// 它与 -retention-days 无关——配额记录不是历史数据，不该跟着保留期一起留 30 天。
+const staleThrottleAge = 24 * time.Hour
 
 // Janitor 周期执行保留策略清理。
 type Janitor struct {
@@ -66,10 +72,14 @@ func (j *Janitor) Clean(ctx context.Context, now time.Time) {
 	if err != nil {
 		slog.Error("delete expired events", "component", "janitor", "cutoff", cutoff, "err", err)
 	}
+	throttles, err := j.Store.DeleteThrottleStateBefore(ctx, now.Add(-staleThrottleAge))
+	if err != nil {
+		slog.Error("delete stale throttle state", "component", "janitor", "err", err)
+	}
 
-	attrs := []any{"component", "janitor", "cutoff", cutoff,
-		"runs", runs, "waits", waits, "events", events, "duration", time.Since(started)}
-	if runs+waits+events > 0 {
+	attrs := []any{"component", "janitor", "cutoff", cutoff, "runs", runs, "waits", waits,
+		"events", events, "throttle_state", throttles, "duration", time.Since(started)}
+	if runs+waits+events+throttles > 0 {
 		slog.Info("retention cleanup", attrs...)
 	} else {
 		slog.Debug("retention cleanup", attrs...)

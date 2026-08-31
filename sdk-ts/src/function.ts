@@ -23,6 +23,11 @@ export interface CancelOnRule {
 /** 传给用户 handler 的上下文。 */
 export interface HandlerContext<T = unknown> {
   event: EventPayload<T>;
+  /**
+   * 批触发（FR-4.7，函数配了 batch）时给出整批事件，按到达顺序；此时 event 是其首条。
+   * 普通触发下不存在该字段。
+   */
+  events?: EventPayload<T>[];
   step: StepTool;
   runId: string;
   attempt: number;
@@ -35,6 +40,36 @@ export interface RunFailedEventData {
   error: string;
   /** 触发该 run 的原始事件 */
   event: EventPayload;
+}
+
+/** 防抖配置（FR-4.5）。时长可写 Go duration 字符串（"5m"）或毫秒数（300000）。 */
+export interface DebounceOpts {
+  /** 合并窗口：窗口内每来一个新事件就把触发时间推后一个 period */
+  period: string | number;
+  /** 可选 expr 表达式（环境只含 data），按其求值结果分组；留空 = 整个函数共用一个窗口 */
+  key?: string;
+  /** 距首个事件的最长延迟，给持续刷新的窗口封顶；缺省 = 不封顶 */
+  timeout?: string | number;
+}
+
+/** 限流配置（FR-4.4）。超限的 run 不丢弃，延迟到下一窗口。 */
+export interface ThrottleOpts {
+  /** 每个窗口内允许启动的 run 数 */
+  limit: number;
+  /** 窗口长度 */
+  period: string | number;
+  /** 可选 expr 表达式（环境只含 data），按其求值结果分组 */
+  key?: string;
+}
+
+/** 批处理配置（FR-4.7）。攒够 maxSize 或距首条超过 timeout 即以事件数组触发一个 run。 */
+export interface BatchOpts {
+  /** 单批最大事件数，随 manifest 上报为 max_size */
+  maxSize: number;
+  /** 距首条事件的最长等待；攒不满时由它兜底 flush */
+  timeout: string | number;
+  /** 可选 expr 表达式（环境只含 data），按其求值结果分组 */
+  key?: string;
 }
 
 export interface FunctionOpts {
@@ -56,6 +91,12 @@ export interface FunctionOpts {
    * 并发 triggerlink/run.failed 事件——配置了 onFailure 的函数会因此触发。缺省 = 不限时。
    */
   timeout?: string | number;
+  /** 防抖（FR-4.5），随 manifest 上报为 debounce。与 batch 同为路由层流控，同时配置时以 debounce 为准 */
+  debounce?: DebounceOpts;
+  /** 限流（FR-4.4），随 manifest 上报为 throttle */
+  throttle?: ThrottleOpts;
+  /** 批处理（FR-4.7），随 manifest 上报为 batch */
+  batch?: BatchOpts;
   /**
    * run 进入 Failed 终态时的处理器（FR-2.11）。serve 时注册隐式函数 <id>/on-failure，
    * 订阅内部事件 triggerlink/run.failed（match 按 function_id 过滤），handler 内可用全部 step 原语。
