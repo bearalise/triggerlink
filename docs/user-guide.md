@@ -481,8 +481,51 @@ async function emitEvent(name, id, data) {
 
 - **Database / CDC**: in Debezium, triggers, or an outbox polling program, turn changed rows into events POSTed to the platform; use `table-primaryKey-operation` as the `id` for idempotency.
 - **Message queue bridging**: turn existing Kafka/RabbitMQ consumers into forwarders that convert messages into events as-is; with event ID deduplication, at-least-once delivery by the bridge is safe.
-- **Webhook ingress**: in your webhook-receiving service, authenticate and then forward as TriggerLink events to gain retries and crash recovery without implementing your own task queue.
+- **Webhook ingress**: the platform has built-in signed webhook endpoints (see Section 6.6); if you run your own webhook-receiving service, authenticate there and forward as TriggerLink events to gain retries and crash recovery without implementing your own task queue.
 - **Scheduled jobs**: M0 has no Cron; use system cron + curl to emit events on a schedule instead (see Section 9).
+
+### 6.6 Webhook Trigger Endpoints (FR-3.4)
+
+For external systems that can only call a URL (Stripe, GitHub, ...), create a dedicated webhook endpoint instead of handing out the event-key. Security relies entirely on an HMAC signature — no basic auth.
+
+Create one via the management API (Dashboard basic auth); the secret is returned in full **only** in the creation response:
+
+```bash
+# Dashboard basic auth 凭据见 4.1 节
+curl --noproxy '*' -u admin:<password> -X POST http://localhost:8288/api/v1/webhooks \
+  -H "Content-Type: application/json" \
+  -d '{"event_name": "stripe/payment"}'           # secret 缺省自动生成，也可显式指定
+# → {"id":"whk_...","url":"/hooks/whk_...","event_name":"stripe/payment","secret":"whsec_..."}
+
+curl --noproxy '*' -u admin:<password> http://localhost:8288/api/v1/webhooks
+# → {"webhooks":[{"id","url","event_name","created_at"}]}   （列表不回显 secret）
+
+curl --noproxy '*' -u admin:<password> -X DELETE http://localhost:8288/api/v1/webhooks/whk_...
+# → 200 {}（不存在则 404）
+```
+
+The external system then POSTs to the dedicated URL, signed with the webhook's secret (same format as the platform↔app signature):
+
+```
+POST http://localhost:8288/hooks/whk_...
+X-TriggerLink-Signature: t=<unix seconds>,v1=<hex(hmac_sha256(secret, "<t>" + "." + "<body>"))>
+```
+
+```bash
+BODY='{"amount":9900,"currency":"CNY"}'
+T=$(date +%s)
+SIG=$(printf '%s.%s' "$T" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+curl --noproxy '*' -X POST http://localhost:8288/hooks/whk_... \
+  -H "X-TriggerLink-Signature: t=$T,v1=$SIG" \
+  -d "$BODY"
+# → 200 {"id":"evt_..."}
+```
+
+Behavior notes:
+
+- The timestamp must be within **±5 minutes** (replay protection); bad/missing signature → 401, unknown webhook ID → 404.
+- The body must be JSON: a JSON object becomes the event's `data` verbatim; any other JSON value is wrapped as `{"payload": <value>}`; non-JSON → 400.
+- After verification the platform **persists the event first, then routes it** (same ordering guarantee as `/v1/events`) with a freshly generated `evt_*` ID; name is the webhook's configured `event_name`. Functions subscribing to that event name are triggered normally.
 
 ## 7. End-to-End Example: Order Fulfillment Pipeline
 

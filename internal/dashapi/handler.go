@@ -1,7 +1,8 @@
 // Package dashapi 实现 Dashboard 的管理 API（PRD 9.3）：以只读端点为主，
 // 另提供写端点：POST /api/v1/runs/{id}/cancel（取消在途 run）、
 // POST /api/v1/runs/{id}/replay（失败 run 一键重跑，FR-6.2）、
-// POST /api/v1/functions/{id}/pause|resume（函数暂停/恢复，FR-7.3）。
+// POST /api/v1/functions/{id}/pause|resume（函数暂停/恢复，FR-7.3）、
+// POST|GET /api/v1/webhooks 与 DELETE /api/v1/webhooks/{id}（webhook 触发端点管理，FR-3.4）。
 // 鉴权由外层中间件负责（internal/auth），本包不含鉴权逻辑。
 package dashapi
 
@@ -19,7 +20,8 @@ import (
 	"github.com/bearalise/triggerlink/internal/store"
 )
 
-// Handler 处理 /api/v1/{events,functions,runs} 只读端点。
+// Handler 处理 /api/v1/{events,functions,runs} 只读端点及写端点
+//（run 取消/重跑、函数暂停/恢复、webhook 触发端点管理 FR-3.4）。
 type Handler struct {
 	st  store.Store
 	reg *registry.Registry
@@ -71,6 +73,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.setFunctionPaused(w, r, strings.TrimSuffix(id, "/resume"), false)
 		default:
 			writeErr(w, http.StatusNotFound, "not found")
+		}
+		return
+	}
+	// webhook 触发端点管理（FR-3.4）
+	if path == "/api/v1/webhooks" || strings.HasPrefix(path, "/api/v1/webhooks/") {
+		switch {
+		case r.Method == http.MethodPost && path == "/api/v1/webhooks":
+			h.createWebhook(w, r)
+		case r.Method == http.MethodGet && path == "/api/v1/webhooks":
+			h.listWebhooks(w, r)
+		case r.Method == http.MethodDelete && strings.HasPrefix(path, "/api/v1/webhooks/"):
+			h.deleteWebhook(w, r, strings.TrimPrefix(path, "/api/v1/webhooks/"))
+		default:
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 		return
 	}
@@ -354,6 +370,78 @@ func (h *Handler) setFunctionPaused(w http.ResponseWriter, r *http.Request, id s
 	}
 	if err := h.st.SetFunctionPaused(r.Context(), id, paused); err != nil {
 		writeErr(w, http.StatusInternalServerError, "set function paused")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+// --- Webhook 触发端点管理（PRD FR-3.4） ---
+
+// webhookDTO 是管理 API 中 webhook 的对外形态。Secret 仅在创建响应中返回
+//（创建后客户端无法再回读完整 secret），列表不回显。
+type webhookDTO struct {
+	ID        string    `json:"id"`
+	URL       string    `json:"url"`
+	EventName string    `json:"event_name"`
+	Secret    string    `json:"secret,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// createWebhook 处理 POST /api/v1/webhooks：body {"event_name", "secret"?}，
+// secret 缺省自动生成；返回的 secret 仅此一次完整可见。
+func (h *Handler) createWebhook(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		EventName string `json:"event_name"`
+		Secret    string `json:"secret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if in.EventName == "" {
+		writeErr(w, http.StatusBadRequest, "event_name required")
+		return
+	}
+	if in.Secret == "" {
+		in.Secret = ids.NewID("whsec")
+	}
+	wh := store.Webhook{ID: ids.NewID("whk"), EventName: in.EventName, Secret: in.Secret, CreatedAt: time.Now()}
+	if err := h.st.CreateWebhook(r.Context(), wh); err != nil {
+		writeErr(w, http.StatusInternalServerError, "create webhook")
+		return
+	}
+	writeJSON(w, http.StatusOK, webhookDTO{
+		ID: wh.ID, URL: "/hooks/" + wh.ID, EventName: wh.EventName, Secret: wh.Secret, CreatedAt: wh.CreatedAt,
+	})
+}
+
+// listWebhooks 处理 GET /api/v1/webhooks：列表不回显 secret。
+func (h *Handler) listWebhooks(w http.ResponseWriter, r *http.Request) {
+	whs, err := h.st.ListWebhooks(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "list webhooks")
+		return
+	}
+	out := make([]webhookDTO, 0, len(whs))
+	for _, wh := range whs {
+		out = append(out, webhookDTO{ID: wh.ID, URL: "/hooks/" + wh.ID, EventName: wh.EventName, CreatedAt: wh.CreatedAt})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"webhooks": out})
+}
+
+// deleteWebhook 处理 DELETE /api/v1/webhooks/{id}；不存在 → 404。
+func (h *Handler) deleteWebhook(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "webhook id required")
+		return
+	}
+	deleted, err := h.st.DeleteWebhook(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "delete webhook")
+		return
+	}
+	if !deleted {
+		writeErr(w, http.StatusNotFound, "webhook not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})

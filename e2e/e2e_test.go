@@ -23,7 +23,9 @@ import (
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/runner"
 	"github.com/bearalise/triggerlink/internal/scheduler"
+	"github.com/bearalise/triggerlink/internal/sign"
 	"github.com/bearalise/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/webhook"
 	triggerlink "github.com/bearalise/triggerlink/sdk"
 	"github.com/bearalise/triggerlink/sdk/step"
 )
@@ -31,6 +33,7 @@ import (
 type stack struct {
 	store    *store.SQLiteStore
 	eventURL string
+	stream   chan store.Event
 }
 
 // startStackRaw 组装 store + runner + executor + eventapi(httptest) + sdk app(httptest)，
@@ -92,7 +95,7 @@ func startStackFull(t *testing.T, fns []*triggerlink.Function,
 
 	eventSrv := httptest.NewServer(eventapi.NewHandler(st, "dev-key", stream))
 	t.Cleanup(eventSrv.Close)
-	return &stack{store: st, eventURL: eventSrv.URL}, reg, app.URL
+	return &stack{store: st, eventURL: eventSrv.URL, stream: stream}, reg, app.URL
 }
 
 // mountDash 挂一个 dashapi httptest server（写端点：replay/pause/resume），不带 basic auth。
@@ -1049,5 +1052,87 @@ func TestRunTimeout(t *testing.T) {
 	}
 	if aCount.Load() != 1 {
 		t.Fatalf("a=%d, want 1", aCount.Load())
+	}
+}
+
+// TestWebhookTrigger：走管理 API 创建 webhook → 带正确签名 POST /hooks/{id} →
+// 订阅该 event_name 的函数 run Completed；错签名 → 401 且不触发（FR-3.4）。
+func TestWebhookTrigger(t *testing.T) {
+	var calls atomic.Int32
+	s, reg, _ := startStackRaw(t,
+		triggerlink.FunctionOpts{ID: "on-payment", Event: "stripe/payment"},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			calls.Add(1)
+			return "ok", nil
+		}, registerApp(t))
+	dashURL := mountDash(t, s.store, reg)
+	hookSrv := httptest.NewServer(webhook.NewHandler(s.store, s.stream))
+	t.Cleanup(hookSrv.Close)
+	ctx := context.Background()
+
+	// 创建 webhook（管理 API，secret 自动生成）
+	req, _ := http.NewRequest(http.MethodPost, dashURL+"/api/v1/webhooks",
+		bytes.NewBufferString(`{"event_name":"stripe/payment"}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		ID     string `json:"id"`
+		URL    string `json:"url"`
+		Secret string `json:"secret"`
+	}
+	json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || created.ID == "" || created.Secret == "" {
+		t.Fatalf("create webhook: status=%d body=%+v", resp.StatusCode, created)
+	}
+
+	// 错签名 → 401，不触发
+	body := `{"amount":100}`
+	badReq, _ := http.NewRequest(http.MethodPost, hookSrv.URL+created.URL, bytes.NewBufferString(body))
+	badReq.Header.Set("X-TriggerLink-Signature", sign.Sign("wrong-secret", []byte(body), time.Now()))
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp.Body.Close()
+	if badResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bad signature: status %d", badResp.StatusCode)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n, _ := s.store.CountRuns(ctx); n != 0 {
+		t.Fatalf("runs=%d after bad signature, want 0", n)
+	}
+
+	// 正确签名 → 200 + 事件路由 → run Completed
+	goodReq, _ := http.NewRequest(http.MethodPost, hookSrv.URL+created.URL, bytes.NewBufferString(body))
+	goodReq.Header.Set("X-TriggerLink-Signature", sign.Sign(created.Secret, []byte(body), time.Now()))
+	goodResp, err := http.DefaultClient.Do(goodReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(goodResp.Body).Decode(&out)
+	goodResp.Body.Close()
+	if goodResp.StatusCode != http.StatusOK || !strings.HasPrefix(out.ID, "evt_") {
+		t.Fatalf("signed post: status=%d body=%+v", goodResp.StatusCode, out)
+	}
+	waitStatus(t, s.store, store.RunCompleted)
+	if calls.Load() != 1 {
+		t.Fatalf("calls=%d, want 1", calls.Load())
+	}
+	runs, _ := s.store.ListRuns(ctx, store.ListRunsOptions{FunctionID: "on-payment"})
+	if len(runs) != 1 || runs[0].EventID != out.ID {
+		t.Fatalf("runs: %+v", runs)
+	}
+	run, err := s.store.GetRun(ctx, runs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(run.EventData) != body || run.EventName != "stripe/payment" {
+		t.Fatalf("run event snapshot: %+v", run)
 	}
 }
