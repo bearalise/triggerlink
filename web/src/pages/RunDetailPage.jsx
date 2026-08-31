@@ -66,7 +66,7 @@ function InFlightBar({ index, startMs, endMs, t0, range }) {
     <li>
       <div className="flex items-center gap-3 text-sm">
         <span className="text-neutral-600 w-6 text-right">#{index}</span>
-        <span className="w-32 shrink-0 font-mono text-neutral-500 italic">executing…</span>
+        <span className="w-56 shrink-0 font-mono text-neutral-500 italic">executing…</span>
         <div className="relative flex-1 h-5 rounded bg-neutral-900 border border-neutral-800 overflow-hidden">
           <div
             className="absolute top-0 h-full rounded-sm bg-blue-500/70 animate-pulse"
@@ -91,7 +91,7 @@ function StepBar({ index, step, startMs, endMs, t0, range }) {
         <span className="text-neutral-600 w-6 text-right">#{index}</span>
         <button
           onClick={() => setOpen(!open)}
-          className="w-32 shrink-0 truncate text-left font-mono text-neutral-200 hover:underline"
+          className="w-56 shrink-0 truncate text-left font-mono text-neutral-200 hover:underline"
           title={step.step_id}
         >
           {step.step_id}

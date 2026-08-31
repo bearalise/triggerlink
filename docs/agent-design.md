@@ -140,7 +140,7 @@ The agent loop never lets the AI SDK auto-execute tools or run its own multi-ste
 agent.run(step, input):
   messages = [user(input)]
   for i in 0..maxIterations-1:
-    resp = await step.run(`agent/${name}/llm`, () =>
+    resp = await step.run(`agent/${name}`, () =>
       generateText({ model, system, messages, tools: schemaOnly(tools) }))
     // resp memo output: { text, toolCalls: [{name, args}], usage }
 
@@ -149,7 +149,7 @@ agent.run(step, input):
     messages.push(assistantMsg(resp))
 
     for call of resp.toolCalls:        // sequential, array order (see §5.3)
-      out = await step.run(`agent/${name}/tool`, () =>
+      out = await step.run(`agent/${name}/${call.name}`, () =>
         tools[call.name].handler(call.args))
       // out memo output: the tool's return value (JSON-serializable)
       messages.push(toolMsg(call, out))
@@ -205,7 +205,7 @@ As with any TriggerLink function, the step sequence must stay deterministic acro
 **Decided: needed, opt-in.** LLM responses and tool outputs are persisted verbatim in step memos (and shown in the dashboard), which can leak secrets, PII, or provider reasoning traces into the database. `createAgent` accepts a `redact` hook that transforms each step's output **inside** `step.run`, before the value is returned and persisted:
 
 ```
-resp = await step.run(`agent/${name}/llm`, async () => {
+resp = await step.run(`agent/${name}`, async () => {
   const raw = await generateText(...);
   return redact ? redact(rawMemo, { kind: "llm", iteration: i }) : rawMemo;
 });

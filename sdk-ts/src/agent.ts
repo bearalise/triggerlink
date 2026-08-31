@@ -221,8 +221,7 @@ export function createAgent(opts: AgentOpts): Agent {
       registry.set(agent.name, agent);
 
       const redact = opts.redact;
-      const llmStepId = `agent/${agent.name}/llm`;
-      const toolStepId = `agent/${agent.name}/tool`;
+      const llmStepId = `agent/${agent.name}`;
       const messages: TextMessage[] = [{ role: "user", content: input }];
       const usage = { inputTokens: 0, outputTokens: 0 };
       const toolCalls: AgentToolCallRecord[] = [];
@@ -280,7 +279,7 @@ export function createAgent(opts: AgentOpts): Agent {
           if (!def) {
             throw new Error(`agent "${agent.name}": model called unknown tool "${call.toolName}"`);
           }
-          const output = await step.run(toolStepId, async () => {
+          const output = await step.run(`agent/${agent.name}/${call.toolName}`, async () => {
             const out: unknown = await def.handler(def.parameters.parse(call.input));
             return redact
               ? redact(out, { kind: "tool", iteration: i, toolName: call.toolName })

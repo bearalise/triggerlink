@@ -123,11 +123,11 @@ test("工具调用流程：llm → tool → llm，各自 memo 化", async () => 
   assert.equal(lastAssistantTextMessageContent(result), "answer");
   assert.equal(model.doGenerateCalls.length, 2);
 
-  // 三个 memo：llm:0、tool:0、llm:1
+  // 三个 memo：两次 LLM（agent/a2）+ 一次工具（agent/a2/search）
   const memos = Object.values(steps);
   assert.deepEqual(
     memos.map((m) => m.id).sort(),
-    [`agent/a2/llm`, `agent/a2/llm`, `agent/a2/tool`].sort(),
+    [`agent/a2`, `agent/a2`, `agent/a2/search`].sort(),
   );
   // 第二次 LLM 调用收到了工具结果
   const secondCall = model.doGenerateCalls[1];
@@ -194,7 +194,7 @@ test("redact 钩子：持久化前改写输出，恢复与后续调用所见即�
 
   const { result, steps } = await drive(agent, "q");
   assert.equal(result.text, "final");
-  const toolMemo = Object.values(steps).find((m) => m.id === "agent/a5/tool");
+  const toolMemo = Object.values(steps).find((m) => m.id === "agent/a5/search");
   assert.deepEqual(toolMemo.output, { hits: 3 }); // secret 未落库
   // 后续 LLM 调用看到的也是脱敏后的结果
   const toolMsg = model.doGenerateCalls[1].prompt.findLast((m) => m.role === "tool");
@@ -217,8 +217,8 @@ test("replay：预置 llm:0/tool:0 memo，恢复只重跑第二次 LLM 调用", 
     createHash("sha256").update(`${FN_ID}:${stepId}:${seq}`).digest("hex");
 
   const preseeded = {
-    [hash("agent/a7/llm", 0)]: {
-      id: "agent/a7/llm",
+    [hash("agent/a7", 0)]: {
+      id: "agent/a7",
       status: "completed",
       output: {
         text: "",
@@ -234,8 +234,8 @@ test("replay：预置 llm:0/tool:0 memo，恢复只重跑第二次 LLM 调用", 
         usage: { inputTokens: 10, outputTokens: 5 },
       },
     },
-    [hash("agent/a7/tool", 0)]: {
-      id: "agent/a7/tool",
+    [hash("agent/a7/search", 0)]: {
+      id: "agent/a7/search",
       status: "completed",
       output: { hits: 3 },
     },
@@ -360,8 +360,8 @@ test("lifecycle.onResponse:memo 命中的恢复重放不触发", async () => {
   const hash = (stepId, seq) =>
     createHash("sha256").update(`${FN_ID}:${stepId}:${seq}`).digest("hex");
   const preseeded = {
-    [hash("agent/lc2/llm", 0)]: {
-      id: "agent/lc2/llm",
+    [hash("agent/lc2", 0)]: {
+      id: "agent/lc2",
       status: "completed",
       output: {
         text: "",
@@ -372,7 +372,7 @@ test("lifecycle.onResponse:memo 命中的恢复重放不触发", async () => {
         usage: { inputTokens: 10, outputTokens: 5 },
       },
     },
-    [hash("agent/lc2/tool", 0)]: { id: "agent/lc2/tool", status: "completed", output: "r" },
+    [hash("agent/lc2/search", 0)]: { id: "agent/lc2/search", status: "completed", output: "r" },
   };
   let fired = 0;
   const model = new MockLanguageModelV4({ doGenerate: textResult("done") });
