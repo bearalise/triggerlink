@@ -94,6 +94,15 @@ type Wait struct {
 	CreatedAt time.Time
 }
 
+// Webhook 是一个外部系统的专用触发端点（PRD FR-3.4）：POST /hooks/{id}
+// 经 HMAC 验签（secret）后转换为名为 EventName 的内部事件。
+type Webhook struct {
+	ID        string
+	EventName string
+	Secret    string
+	CreatedAt time.Time
+}
+
 // RegisteredFunction 是一条持久化的函数注册记录（PRD FR-5.3 的存储形态）。
 // 以函数 ID 为主键：函数迁移到新 appURL 时 upsert 覆盖旧行，与 Registry.Sync 语义对齐。
 // CancelOn 是 cancelOn 规则（FR-4.9）的 JSON 序列化形态，空串表示无。
@@ -166,6 +175,11 @@ type Store interface {
 	IsFunctionPaused(ctx context.Context, functionID string) (bool, error)
 	PausedFunctionIDs(ctx context.Context) (map[string]bool, error)
 	TimeoutRun(ctx context.Context, id string, errMsg string) (bool, error)
+
+	CreateWebhook(ctx context.Context, w Webhook) error
+	GetWebhook(ctx context.Context, id string) (Webhook, error)
+	ListWebhooks(ctx context.Context) ([]Webhook, error)
+	DeleteWebhook(ctx context.Context, id string) (bool, error)
 }
 
 // SQLiteStore 是 Store 的 SQLite 实现。
@@ -260,6 +274,12 @@ CREATE INDEX IF NOT EXISTS idx_waits_event ON waits(status, event_name);
 CREATE TABLE IF NOT EXISTS paused_functions (
   function_id TEXT PRIMARY KEY,
   paused_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS webhooks (
+  id         TEXT PRIMARY KEY,
+  event_name TEXT NOT NULL,
+  secret     TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 `)
 	if err != nil {
@@ -821,4 +841,61 @@ func (s *SQLiteStore) PausedFunctionIDs(ctx context.Context) (map[string]bool, e
 		out[id] = true
 	}
 	return out, rows.Err()
+}
+
+// CreateWebhook 写入一条 webhook 触发端点记录（PRD FR-3.4）。
+func (s *SQLiteStore) CreateWebhook(ctx context.Context, w Webhook) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO webhooks (id, event_name, secret, created_at) VALUES (?,?,?,?)`,
+		w.ID, w.EventName, w.Secret, fmtTime(w.CreatedAt))
+	return err
+}
+
+// GetWebhook 读取单个 webhook；不存在时返回 sql.ErrNoRows。
+func (s *SQLiteStore) GetWebhook(ctx context.Context, id string) (Webhook, error) {
+	var w Webhook
+	var cat string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, event_name, secret, created_at FROM webhooks WHERE id=?`, id).
+		Scan(&w.ID, &w.EventName, &w.Secret, &cat)
+	if err != nil {
+		return Webhook{}, err
+	}
+	if w.CreatedAt, err = parseTime(cat); err != nil {
+		return Webhook{}, err
+	}
+	return w, nil
+}
+
+// ListWebhooks 返回全部 webhook（管理列表用），按创建时间升序。
+func (s *SQLiteStore) ListWebhooks(ctx context.Context) ([]Webhook, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, event_name, secret, created_at FROM webhooks ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Webhook
+	for rows.Next() {
+		var w Webhook
+		var cat string
+		if err := rows.Scan(&w.ID, &w.EventName, &w.Secret, &cat); err != nil {
+			return nil, err
+		}
+		if w.CreatedAt, err = parseTime(cat); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// DeleteWebhook 删除一个 webhook；返回 false 表示不存在（404 语义）。
+func (s *SQLiteStore) DeleteWebhook(ctx context.Context, id string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM webhooks WHERE id=?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }

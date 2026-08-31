@@ -352,3 +352,41 @@ GET  /api/v1/functions              → each entry additionally carries "paused"
 
 - **Replay** creates a brand-new run from the original run's triggering-event snapshot and executes it from scratch — no step memos are inherited from the original run.
 - **Pause** stops the function from accepting new triggers; in-flight runs continue to completion. **Resume** re-enables triggering.
+
+### Admin API: Webhook Trigger Endpoints (Dashboard basic auth, FR-3.4)
+
+Dedicated signed URLs for external systems (Stripe, GitHub, ...) that cannot carry the event-key:
+
+```
+POST   /api/v1/webhooks        body {"event_name": "stripe/payment", "secret"?}
+                               → 200 {"id": "whk_...", "url": "/hooks/whk_...", "event_name": "...", "secret": "..."}
+                               (secret is auto-generated when omitted, and returned in full ONLY here)
+GET    /api/v1/webhooks        → 200 {"webhooks": [{"id", "url", "event_name", "created_at"}]}  (secret is never echoed)
+DELETE /api/v1/webhooks/{id}   → 200 {}; 404 if the webhook does not exist
+```
+
+Receiving endpoint — **public path, no basic auth; security relies entirely on the HMAC signature**:
+
+```
+POST /hooks/{id}
+X-TriggerLink-Signature: t=<unix seconds>,v1=<hex(hmac_sha256(secret, "<t>" + "." + "<body>"))>
+```
+
+- Signature format is identical to §2 Request Signing (same `internal/sign` implementation), but keyed by the webhook's own `secret`; the timestamp is validated against the same **±5 minute** replay window.
+- The body must be JSON: a JSON object becomes the event `data` verbatim; any other JSON value (array, string, number, ...) is wrapped as `{"payload": <value>}`; a non-JSON body → 400.
+- Bad/missing signature → 401; unknown webhook ID → 404.
+- On success the platform first persists an event (`name` = the configured `event_name`, freshly generated `evt_*` ID, `data` = request body), then pushes it onto the routing stream, then returns `200 {"id": "<event_id>"}` — the same persist-before-route ordering guarantee as `POST /v1/events`.
+
+curl example:
+
+```bash
+BODY='{"amount":9900,"currency":"CNY"}'
+T=$(date +%s)
+SIG=$(printf '%s.%s' "$T" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+curl -X POST http://localhost:8288/hooks/whk_... \
+  -H "X-TriggerLink-Signature: t=$T,v1=$SIG" \
+  -d "$BODY"
+# → 200 {"id":"evt_..."}
+```
+
+See `internal/webhook/handler.go` (receiving) and the webhook section of `internal/dashapi/handler.go` (management) for details.

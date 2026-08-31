@@ -24,6 +24,7 @@ import (
 	"github.com/bearalise/triggerlink/internal/runner"
 	"github.com/bearalise/triggerlink/internal/scheduler"
 	"github.com/bearalise/triggerlink/internal/store"
+	"github.com/bearalise/triggerlink/internal/webhook"
 )
 
 // version 由 goreleaser 通过 -ldflags "-X main.version=..." 注入；本地构建为 dev。
@@ -172,6 +173,10 @@ func main() {
 	mux.Handle("/api/v1/functions", secure(dash))
 	mux.Handle("/api/v1/runs", secure(dash))
 	mux.Handle("/api/v1/runs/", secure(dash))
+	mux.Handle("/api/v1/webhooks", secure(dash))
+	mux.Handle("/api/v1/webhooks/", secure(dash))
+	// webhook 接收端点：公开路径（不套 basic auth），安全完全依赖 HMAC 验签（FR-3.4）
+	mux.Handle("/hooks/", webhook.NewHandler(st, stream))
 	mux.Handle("/dashboard/", secure(dashboard.Handler()))
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
