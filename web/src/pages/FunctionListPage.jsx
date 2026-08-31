@@ -58,7 +58,18 @@ export default function FunctionListPage() {
                     </span>
                   )}
                 </td>
-                <td className="font-mono text-xs text-neutral-300">{f.event}</td>
+                <td className="font-mono text-xs text-neutral-300">
+                  {f.event}
+                  {(f.flow_control || []).map((kind) => (
+                    <span
+                      key={kind}
+                      title={`${kind} configured (see the function definition for parameters)`}
+                      className="ml-1 inline-block px-1.5 rounded-full bg-sky-500/10 border border-sky-900 text-sky-400 text-xs"
+                    >
+                      {kind}
+                    </span>
+                  ))}
+                </td>
                 <td className="font-mono text-xs text-neutral-500">{f.app_url}</td>
                 <td className="text-neutral-400">{f.stats_24h.total}</td>
                 <td className="text-neutral-300">

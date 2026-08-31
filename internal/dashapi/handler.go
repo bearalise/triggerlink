@@ -155,8 +155,10 @@ type runDetailDTO struct {
 	runDTO
 	EventData json.RawMessage `json:"event_data"`
 	EventTS   time.Time       `json:"event_ts"`
-	Output    json.RawMessage `json:"output,omitempty"`
-	Error     string          `json:"error,omitempty"`
+	// Batch 为真时 EventData 是事件对象数组（FR-4.7 批触发），前端据此改用批视图。
+	Batch  bool            `json:"batch,omitempty"`
+	Output json.RawMessage `json:"output,omitempty"`
+	Error  string          `json:"error,omitempty"`
 }
 
 type stepDTO struct {
@@ -176,11 +178,29 @@ type statsDTO struct {
 }
 
 type functionDTO struct {
-	ID       string   `json:"id"`
-	Event    string   `json:"event"`
-	AppURL   string   `json:"app_url"`
-	Paused   bool     `json:"paused"`
-	Stats24h statsDTO `json:"stats_24h"`
+	ID     string `json:"id"`
+	Event  string `json:"event"`
+	AppURL string `json:"app_url"`
+	Paused bool   `json:"paused"`
+	// 流控徽标（FR-4.4/4.5/4.7）：只报"配了什么"，具体参数在应用代码里，
+	// Dashboard 不复述——避免注册表与展示各存一份配置定义。
+	FlowControl []string `json:"flow_control,omitempty"`
+	Stats24h    statsDTO `json:"stats_24h"`
+}
+
+// flowControlLabels 返回该函数启用的流控种类，顺序固定便于前端稳定渲染。
+func flowControlLabels(f registry.Function) []string {
+	var out []string
+	if f.Debounce != nil {
+		out = append(out, "debounce")
+	}
+	if f.Throttle != nil {
+		out = append(out, "throttle")
+	}
+	if f.Batch != nil {
+		out = append(out, "batch")
+	}
+	return out
 }
 
 // --- handlers ---
@@ -278,7 +298,7 @@ func (h *Handler) getRun(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"run": runDetailDTO{
 			runDTO:    toRunDTO(run),
-			EventData: run.EventData, EventTS: run.EventTS,
+			EventData: run.EventData, EventTS: run.EventTS, Batch: run.Batch,
 			Output: run.Output, Error: run.Error,
 		},
 		"steps": steps,
@@ -466,7 +486,8 @@ func (h *Handler) listFunctions(w http.ResponseWriter, r *http.Request) {
 			s := stats[f.ID]
 			out = append(out, functionDTO{
 				ID: f.ID, Event: f.Event, AppURL: appURL, Paused: paused[f.ID],
-				Stats24h: statsDTO{Total: s.Total, Completed: s.Completed, Failed: s.Failed},
+				FlowControl: flowControlLabels(f),
+				Stats24h:    statsDTO{Total: s.Total, Completed: s.Completed, Failed: s.Failed},
 			})
 		}
 	}

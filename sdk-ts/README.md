@@ -57,6 +57,28 @@ client.register("http://localhost:3000/api/triggerlink"); // requires eventKey
 
 Note: for local development, point the serve URL at `http://localhost:3000/api/triggerlink`; after changing functions in the app, call `POST /api/v1/apps/sync {"url":"..."}` to sync — no platform restart needed.
 
+## Flow control (debounce / throttle / batch)
+
+Three optional knobs on `createFunction`; durations accept a Go duration string (`"5m"`) or a millisecond number.
+
+```ts
+// Collapse a burst of edits into one run, keeping the last event
+createFunction({ id: "index-doc", event: "doc/changed",
+  debounce: { period: "5m", key: "data.doc_id", timeout: "1h" } }, handler);
+
+// At most 10 runs start per minute per tenant; over-limit runs are delayed, not dropped
+createFunction({ id: "call-api", event: "api/call",
+  throttle: { limit: 10, period: "1m", key: "data.tenant" } }, handler);
+
+// Trigger once per 100 events (or every 30s), receiving the whole batch
+createFunction({ id: "bulk-index", event: "doc/changed",
+  batch: { maxSize: 100, timeout: "30s" } }, async (ctx) => {
+    for (const e of ctx.events ?? []) { /* arrival order; ctx.event is the first */ }
+  });
+```
+
+`key` is an expr-lang expression over `data` that groups events into independent windows/quotas. Debounce and batch both act at the routing layer — configuring both makes debounce win. See the User Guide section 5.3.8 for the full semantics.
+
 ## Constraints (same as the Go SDK; see protocol section 6)
 
 - Side effects must go inside `step.run`; the function is re-invoked from the start on every callback, so code outside steps runs repeatedly;

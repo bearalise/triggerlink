@@ -3,7 +3,7 @@
 > 目标：完成 PRD 第 6 章 M2 剩余功能——流控（debounce/throttle/batching）、可观测性（slog/metrics/保留策略）、Postgres 存储后端。
 > 依据：`docs/triggerlink-prd.md` FR-4.4/4.5/4.7、FR-6.3/6.4/6.6、第 7 章存储设计。
 > 现状基线：main @ c47d257 之后。SQLite 单后端；`store.Store` 接口约 40 个方法（`internal/store/store.go:122`）；执行器并发控制为内存 `inFlight` map（`internal/executor/executor.go:51`）；队列 = `queue_items` 表 + `UPDATE...RETURNING` 原子租赁；manifest 已有字段 id/event/match/cron/retries/cancel_on/timeout。
-> 执行顺序：**阶段 B（可观测性，已完成）→ 阶段 A（流控）→ 阶段 C（Postgres）**。B 独立且是压测/发布门禁的前提；A 动队列调度核心，放在观测能力就绪后便于验证；C 工作量最大且依赖 A/B 的 Store 接口最终形态。
+> 执行顺序：**阶段 B（可观测性，已完成）→ 阶段 A（流控，已完成）→ 阶段 C（Postgres）**。B 独立且是压测/发布门禁的前提；A 动队列调度核心，放在观测能力就绪后便于验证；C 工作量最大且依赖 A/B 的 Store 接口最终形态。
 > 每个阶段独立成 PR：开分支 → 实现 → 全量测试（含 e2e）→ 推送开 PR → 合并。SDK 有面向用户改动时发 npm patch/minor。
 
 ---
@@ -56,7 +56,17 @@
 
 ---
 
-## 阶段 A：流控（FR-4.5 debounce / FR-4.4 throttle / FR-4.7 batching）
+## 阶段 A：流控（FR-4.5 debounce / FR-4.4 throttle / FR-4.7 batching）✅ 已完成
+
+分支 `feat/flow-control`，四个 commit（A0 基建 / A1 debounce / A2 throttle / A3 batching）+ A4 收尾。与计划的差异：
+
+- A0：三个配置类型各自实现 Marshal/UnmarshalJSON，清单形态与落库形态是同一段 JSON，持久化只是原样存一列——不再需要"注册表结构 ↔ 落库字段"的手写映射。
+- A1：store 方法比计划多一个 `UpdateQueueItemAt` 的返回值（改动行数），用于识别"续窗时队列项已被租赁"。
+- A2：新增 `internal/flowkey` 共享包——key 求值同时发生在路由层与执行层，必须对同一事件算出同一个键；runner 内的实现已删除。
+- A3：runs 表加 `batch` 列显式标记批 run，而非按"event_data 看着像数组"推断（普通事件的 data 本身就可能是数组）。`FlushBatch` 只删本次读过的 seq，flush 期间到达的事件不丢。
+- 计划未提但做了：janitor 清理 24h 前的 throttle 配额行；events_routed_total 增加 debounced/batched 两个结果值；新增 runs_throttled_total。
+
+
 
 预估 2.5–3.5 天。三个功能共享基础设施：函数配置扩展（manifest 三个新字段）+ registry 持久化三个新列 + runner 路由分流 + SDK 双端配置。**建议顺序：debounce → throttle → batching**（复杂度递增，batching 涉及协议 ctx.events 字段启用）。
 

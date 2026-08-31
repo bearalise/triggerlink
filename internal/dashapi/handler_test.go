@@ -364,3 +364,55 @@ func TestPauseResumeEndpoints(t *testing.T) {
 		t.Fatalf("pause ghost: %d", rec.Code)
 	}
 }
+
+// 函数列表带出流控徽标（只报种类，不复述参数）；批 run 的详情带 batch 标记。
+func TestFlowControlBadgesAndBatchRun(t *testing.T) {
+	h, st, reg := newTestHandler(t)
+	ctx := context.Background()
+	reg.Register(registry.Function{ID: "fn-flow", Event: "doc/changed", AppURL: "http://app",
+		Debounce: &registry.Debounce{Period: time.Minute},
+		Batch:    &registry.Batch{MaxSize: 10, Timeout: time.Minute}})
+	reg.Register(registry.Function{ID: "fn-plain", Event: "doc/changed", AppURL: "http://app"})
+
+	rec := doGet(t, h, "/api/v1/functions")
+	var fn struct {
+		Functions []struct {
+			ID          string   `json:"id"`
+			FlowControl []string `json:"flow_control"`
+		} `json:"functions"`
+	}
+	decode(t, rec, &fn)
+	byID := map[string][]string{}
+	for _, f := range fn.Functions {
+		byID[f.ID] = f.FlowControl
+	}
+	if got := byID["fn-flow"]; len(got) != 2 || got[0] != "debounce" || got[1] != "batch" {
+		t.Fatalf("fn-flow flow_control=%v, want [debounce batch]", got)
+	}
+	if got := byID["fn-plain"]; len(got) != 0 {
+		t.Fatalf("fn-plain flow_control=%v, want none", got)
+	}
+
+	// 批 run 详情：batch=true，event_data 是事件数组
+	events := json.RawMessage(`[{"id":"evt_a","name":"doc/changed","data":{"n":1},"ts":"2026-01-01T00:00:00Z"}]`)
+	if _, err := st.CreateRun(ctx, store.Run{
+		ID: "run_batch00000000001", FunctionID: "fn-flow", EventID: "evt_a",
+		EventName: "doc/changed", EventData: events, EventTS: time.Now(), Batch: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec = doGet(t, h, "/api/v1/runs/run_batch00000000001")
+	var detail struct {
+		Run struct {
+			Batch     bool            `json:"batch"`
+			EventData json.RawMessage `json:"event_data"`
+		} `json:"run"`
+	}
+	decode(t, rec, &detail)
+	if !detail.Run.Batch {
+		t.Fatal("batch run detail must carry batch=true")
+	}
+	if string(detail.Run.EventData) != string(events) {
+		t.Fatalf("event_data=%s, want the event array", detail.Run.EventData)
+	}
+}

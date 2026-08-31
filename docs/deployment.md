@@ -114,11 +114,12 @@ See the "Deploying the Platform" section of the [User Guide](user-guide.md) for 
 | Series | Type | Meaning |
 |---|---|---|
 | `triggerlink_events_received_total` | counter | Events accepted at an ingress (Event API + webhook endpoints), duplicates included |
-| `triggerlink_events_routed_total{result}` | counter | Routing decisions per (event, subscribing function); `result` = `routed` / `paused` / `filtered` (trigger `match` missed) / `no_subscriber` (counted once per unsubscribed event) |
+| `triggerlink_events_routed_total{result}` | counter | Routing decisions per (event, subscribing function); `result` = `routed` / `paused` / `filtered` (trigger `match` missed) / `debounced` (merged into an open debounce window) / `batched` (added to a batch window) / `no_subscriber` (counted once per unsubscribed event) |
 | `triggerlink_runs_total{status}` | counter | Runs that reached a terminal state; `status` = `completed` / `failed` / `cancelled` / `timeout` |
 | `triggerlink_run_duration_seconds` | histogram | Run creation → terminal state, durable sleeps and waits included |
 | `triggerlink_step_duration_seconds{op}` | histogram | `Run` / `SendEvent` = in-callback execution time; `Sleep` = requested sleep length; `WaitForEvent` = wall-clock until resolved |
 | `triggerlink_callback_duration_seconds` | histogram | Platform→app callback round trip, one per run hop |
+| `triggerlink_runs_throttled_total` | counter | Dispatch attempts deferred by throttle (FR-4.4), counted once per deferral |
 | `triggerlink_queue_depth` | gauge | Pending queue items already due (`at <= now`) |
 | `triggerlink_waits_active` | gauge | `step.waitForEvent` suspensions still waiting |
 
