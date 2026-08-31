@@ -1,4 +1,6 @@
-package triggerlink
+// 外部测试包 + dot import：step 包依赖本包（WaitForEvent 返回 triggerlink.Event），
+// 内部测试包再 import step 会构成 Go 不允许的测试 import cycle；dot import 保持下文无需限定名。
+package triggerlink_test
 
 import (
 	"bytes"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/bearalise/triggerlink/sdk"
 	"github.com/bearalise/triggerlink/sdk/internal/execx"
 	"github.com/bearalise/triggerlink/sdk/step"
 )
@@ -94,6 +97,48 @@ func TestGetManifest(t *testing.T) {
 	if m.SDK != "triggerlink-go/0.0.0-m0" || m.AppID != "docsvc" ||
 		len(m.Functions) != 1 || m.Functions[0].ID != "process-doc" || m.Functions[0].Event != "doc/uploaded" {
 		t.Fatalf("manifest=%+v", m)
+	}
+}
+
+func TestManifestCancelOn(t *testing.T) {
+	fn := CreateFunction(FunctionOpts{
+		ID: "onboarding", Event: "user/signup",
+		CancelOn: []CancelOn{
+			{Event: "user/deleted", Match: "data.user_id == event.data.user_id"},
+			{Event: "user/opted-out"},
+		},
+	}, func(ctx context.Context, in Input) (any, error) { return nil, nil })
+	h := Serve(testClient(), fn)
+	req := httptest.NewRequest(http.MethodGet, "/api/triggerlink", nil)
+	req.Header.Set("X-TriggerLink-Signature", signHeader("k", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	body := rec.Body.Bytes()
+
+	var m struct {
+		Functions []struct {
+			ID       string `json:"id"`
+			CancelOn []struct {
+				Event string `json:"event"`
+				Match string `json:"match"`
+			} `json:"cancel_on"`
+		} `json:"functions"`
+	}
+	json.Unmarshal(body, &m)
+	if len(m.Functions) != 1 || len(m.Functions[0].CancelOn) != 2 {
+		t.Fatalf("manifest=%s", body)
+	}
+	c0, c1 := m.Functions[0].CancelOn[0], m.Functions[0].CancelOn[1]
+	if c0.Event != "user/deleted" || c0.Match != "data.user_id == event.data.user_id" {
+		t.Fatalf("cancel_on[0]=%+v", c0)
+	}
+	if c1.Event != "user/opted-out" || c1.Match != "" {
+		t.Fatalf("cancel_on[1]=%+v", c1)
+	}
+	// match 为空时按 omitempty 省略（与服务端 CancelRule 反序列化对齐）
+	if !bytes.Contains(body, []byte(`"cancel_on"`)) ||
+		bytes.Count(body, []byte(`"match"`)) != 1 {
+		t.Fatalf("body=%s", body)
 	}
 }
 

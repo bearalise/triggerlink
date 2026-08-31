@@ -14,12 +14,20 @@ import (
 	"github.com/bearalise/triggerlink/internal/sign"
 )
 
+// CancelRule 是一条 cancelOn 规则（FR-4.9）：到达事件名为 Event 且 match 表达式命中时，
+// 取消该函数的在途 run。Match 为空表示该事件到达即取消。
+type CancelRule struct {
+	Event string `json:"event"`
+	Match string `json:"match,omitempty"`
+}
+
 // Function 是一个已注册的 durable 函数的路由条目。
 type Function struct {
-	ID      string `json:"id"`
-	Event   string `json:"event"`
-	Retries int    `json:"retries"`
-	AppURL  string `json:"-"`
+	ID       string       `json:"id"`
+	Event    string       `json:"event"`
+	Retries  int          `json:"retries"`
+	CancelOn []CancelRule `json:"cancel_on,omitempty"`
+	AppURL   string       `json:"-"`
 }
 
 type manifest struct {
@@ -70,6 +78,22 @@ func (r *Registry) Lookup(functionID string) (Function, bool) {
 	defer r.mu.RUnlock()
 	f, ok := r.byID[functionID]
 	return f, ok
+}
+
+// CancelMatchers 返回注册了针对某事件名的 cancelOn 规则的全部函数（FR-4.9）。
+func (r *Registry) CancelMatchers(eventName string) []Function {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []Function
+	for _, f := range r.byID {
+		for _, rule := range f.CancelOn {
+			if rule.Event == eventName {
+				out = append(out, f)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // Sync 用一次内省结果整体替换 appURL 名下的函数集合（PRD FR-5.3 的运行时形态）。

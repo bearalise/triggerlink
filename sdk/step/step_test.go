@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	triggerlink "github.com/bearalise/triggerlink/sdk"
 	"github.com/bearalise/triggerlink/sdk/internal/execx"
 )
 
@@ -154,6 +155,99 @@ func TestSendEventEmptyReturnsError(t *testing.T) {
 	ctx := execx.With(context.Background(), ec)
 	if _, err := SendEvent(ctx, "notify"); err == nil {
 		t.Fatal("expected error for empty events")
+	}
+}
+
+func TestWaitForEventMissPanicsOpcode(t *testing.T) {
+	ec := execx.New("fn", nil)
+	ctx := execx.With(context.Background(), ec)
+
+	op := capture(ctx, func() {
+		_, _ = WaitForEvent(ctx, "wait-payment", WaitOpts{
+			Event:   "order/payed",
+			Match:   "data.order_id == event.data.order_id",
+			Timeout: 7 * 24 * time.Hour,
+		})
+	})
+	if op == nil || op.Op != "WaitForEvent" || op.StepID != "wait-payment" || op.ID == "" {
+		t.Fatalf("op=%+v", op)
+	}
+	if op.Event != "order/payed" {
+		t.Fatalf("event=%q", op.Event)
+	}
+	if op.Match != "data.order_id == event.data.order_id" {
+		t.Fatalf("match=%q", op.Match)
+	}
+	if op.Timeout != "168h0m0s" { // time.Duration.String() 序列化
+		t.Fatalf("timeout=%q", op.Timeout)
+	}
+}
+
+func TestWaitForEventNoOptionalFields(t *testing.T) {
+	ec := execx.New("fn", nil)
+	ctx := execx.With(context.Background(), ec)
+
+	op := capture(ctx, func() {
+		_, _ = WaitForEvent(ctx, "wait", WaitOpts{Event: "order/payed"})
+	})
+	if op == nil || op.Op != "WaitForEvent" || op.Match != "" || op.Timeout != "" {
+		t.Fatalf("op=%+v", op)
+	}
+}
+
+func TestWaitForEventMemoHitReturnsEvent(t *testing.T) {
+	pre := execx.New("fn", nil)
+	h := pre.NextHash("wait-payment")
+
+	ts := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	out, _ := json.Marshal(map[string]any{
+		"id": "evt_pay", "name": "order/payed",
+		"data": map[string]any{"order_id": "o1"}, "ts": ts,
+	})
+	ec := execx.New("fn", map[string]execx.StepState{
+		h: {ID: "wait-payment", Status: "completed", Output: out},
+	})
+	ctx := execx.With(context.Background(), ec)
+
+	var ev *triggerlink.Event
+	var err error
+	op := capture(ctx, func() {
+		ev, err = WaitForEvent(ctx, "wait-payment", WaitOpts{Event: "order/payed"})
+	})
+	if op != nil {
+		t.Fatalf("memo hit must not panic, got %+v", op)
+	}
+	if err != nil || ev == nil {
+		t.Fatalf("ev=%v err=%v", ev, err)
+	}
+	if ev.ID != "evt_pay" || ev.Name != "order/payed" || !ev.TS.Equal(ts) {
+		t.Fatalf("ev=%+v", ev)
+	}
+	if string(ev.Data) != `{"order_id":"o1"}` {
+		t.Fatalf("data=%s", ev.Data)
+	}
+}
+
+func TestWaitForEventMemoNullReturnsNil(t *testing.T) {
+	pre := execx.New("fn", nil)
+	h := pre.NextHash("wait-payment")
+
+	ec := execx.New("fn", map[string]execx.StepState{
+		h: {ID: "wait-payment", Status: "completed", Output: json.RawMessage("null")}, // 超时分支
+	})
+	ctx := execx.With(context.Background(), ec)
+
+	ev, err := WaitForEvent(ctx, "wait-payment", WaitOpts{Event: "order/payed"})
+	if err != nil || ev != nil {
+		t.Fatalf("ev=%v err=%v, want nil,nil", ev, err)
+	}
+}
+
+func TestWaitForEventRequiresEvent(t *testing.T) {
+	ec := execx.New("fn", nil)
+	ctx := execx.With(context.Background(), ec)
+	if _, err := WaitForEvent(ctx, "wait", WaitOpts{}); err == nil {
+		t.Fatal("expected error for empty event")
 	}
 }
 

@@ -64,6 +64,7 @@ At startup, the platform sends one signed GET (no body) to each configured `-app
 | `functions[].id` | string | Stable function identifier (renaming it loses the association with historical memos) |
 | `functions[].event` | string | Subscribed event name (exact match against the event's `name`) |
 | `functions[].retries` | int | Retry limit; 0 = platform default (4). The M0 platform does not yet differentiate this per function |
+| `functions[].cancel_on` | array | Optional cancel rules: `[{"event": "user/deleted", "match": "data.user_id == event.data.user_id"}]`. When the named event arrives and `match` evaluates true, the platform cancels that function's in-flight (Queued/Running) runs; an omitted `match` means "cancel on arrival". `match` is an expr-lang expression evaluated with `data` = the arriving event's `data` and `event` = the run's triggering event `{"name", "data"}` |
 
 Non-200 response or timeout: the platform logs a warning and skips that app (non-fatal; other apps register as usual).
 
@@ -128,7 +129,7 @@ Common structure:
 }
 ```
 
-`op` has six possible values; platform behavior for each:
+`op` has seven possible values; platform behavior for each:
 
 ### 5.1 `StepComplete`
 
@@ -214,6 +215,26 @@ Platform behavior:
 
 SDK semantics: memo hit → deserialize `output` and return the ID list directly (**no re-send**); miss → throw a `SendEvent` interrupt. The SDK return value is `string[]` (the event ID list).
 
+### 5.7 `WaitForEvent`
+
+Request to suspend the run until a matching event arrives or a timeout elapses (`step.WaitForEvent` / `step.waitForEvent`).
+
+| Field | Required | Description |
+|---|---|---|
+| `id` | Yes | Memo key |
+| `step_id` | Yes | Step name |
+| `event` | Yes | Name of the event to wait for; if missing, treated as "this attempt failed" (backoff retry) |
+| `match` | No | expr-lang expression for fine-grained matching; same evaluation environment as `cancel_on` (Section 3): `data` = the arriving event's `data`, `event` = the run's triggering event `{"name", "data"}`. Empty = any event with this name matches |
+| `timeout` | No | Maximum wait as a Go duration string (e.g. `"168h"`, `"30m"`); absent = wait forever |
+
+Platform behavior (event-driven suspend + resume):
+
+1. **Suspend**: write the waiting memo (`(run_id, step_hash)`, `status="waiting"`, `op="WaitForEvent"`) + persist a wait record (event name, match expression, expiry) → complete the current queue item → **do not enqueue**. While suspended, the run stays `Running` with no connection or compute held. The wait record is idempotent on `(run_id, step_hash)`: replaying the same opcode within a crash window creates no duplicate wait.
+2. **Resume on match**: when an event is routed, each waiting record with the same event name whose `match` evaluates true gets its memo flipped to `completed` with `output` = the matched event `{"id", "name", "data", "ts"}`, and the run is re-enqueued with `at = now`.
+3. **Resume on timeout**: a periodic scan expires waits whose `timeout` has elapsed; the step memo is completed with `output` = JSON `null`, and the run is re-enqueued the same way.
+
+SDK semantics: memo hit → if `output` is JSON `null`, return `nil` (Go) / `null` (TS) — this is the timeout branch; otherwise deserialize `output` into the event object and return it. Miss → throw a `WaitForEvent` interrupt (Go serializes `timeout` via `time.Duration.String()`; TS accepts a Go duration string or a millisecond number, e.g. `1500` → `"1.5s"`).
+
 ## 6. Step Memo Key (step_hash) Semantics
 
 - **Platform's view: an opaque string**. The platform only stores/loads memos by `(run_id, step_hash)` and injects them verbatim on the next callback; it never computes or interprets the key.
@@ -251,7 +272,7 @@ A minimal viable SDK needs:
    - Build the execution context (inject the `steps` memos + a per-stepID occurrence counter);
    - Invoke the user handler and capture three result classes: step interrupt (a language-level exception mechanism, e.g. Go panic, TS/Python throw) → `StepComplete`/`StepError`; handler returns normally → `RunComplete`; any other exception → `RunError`;
    - Serialize the opcode and return 200.
-3. **Step primitives**: `run` — memo hit (`steps[hash]` exists) → deserialize `output` and return it directly; miss → run the user fn, throwing a `StepComplete` interrupt on success or a `StepError` interrupt on failure. `sleep`/`sleepUntil` — memo hit → return directly; miss → throw a `Sleep` interrupt (carrying `until`). `sendEvent` — memo hit → return the ID list directly; miss → throw a `SendEvent` interrupt (carrying the event array).
+3. **Step primitives**: `run` — memo hit (`steps[hash]` exists) → deserialize `output` and return it directly; miss → run the user fn, throwing a `StepComplete` interrupt on success or a `StepError` interrupt on failure. `sleep`/`sleepUntil` — memo hit → return directly; miss → throw a `Sleep` interrupt (carrying `until`). `sendEvent` — memo hit → return the ID list directly; miss → throw a `SendEvent` interrupt (carrying the event array). `waitForEvent` — memo hit → return the event object (`output` = JSON `null` means the timeout branch → return nil/null); miss → throw a `WaitForEvent` interrupt (carrying `event`, optional `match` and `timeout`).
 4. **Event type**: `{id, name, data, ts}`, same shape as in Section 4.
 
 The platform does not validate SDK internals — it only cares about the on-the-wire behavior in Sections 2–5.

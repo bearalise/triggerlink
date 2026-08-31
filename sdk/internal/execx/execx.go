@@ -35,6 +35,10 @@ type Opcode struct {
 	Err    *OpError   `json:"error,omitempty"`
 	Until  *time.Time `json:"until,omitempty"`  // Sleep：唤醒时刻
 	Events any        `json:"events,omitempty"` // SendEvent：待扇出事件列表
+
+	Event   string `json:"event,omitempty"`   // WaitForEvent：等待的事件名（必填）
+	Match   string `json:"match,omitempty"`   // WaitForEvent：可选 match 表达式（expr-lang）
+	Timeout string `json:"timeout,omitempty"` // WaitForEvent：可选超时（Go duration，如 168h）
 }
 
 // Ctx 是单次函数调用的执行上下文。

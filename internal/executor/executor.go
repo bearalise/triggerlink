@@ -134,13 +134,16 @@ type opError struct {
 }
 
 type opcode struct {
-	Op     string          `json:"op"`
-	ID     string          `json:"id,omitempty"`
-	StepID string          `json:"step_id,omitempty"`
-	Output json.RawMessage `json:"output,omitempty"`
-	Error  *opError        `json:"error,omitempty"`
-	Until  time.Time       `json:"until,omitempty"`  // Sleep opcode：唤醒时间（RFC3339）
-	Events []sendEventIn   `json:"events,omitempty"` // SendEvent opcode：待扇出事件
+	Op      string          `json:"op"`
+	ID      string          `json:"id,omitempty"`
+	StepID  string          `json:"step_id,omitempty"`
+	Output  json.RawMessage `json:"output,omitempty"`
+	Error   *opError        `json:"error,omitempty"`
+	Until   time.Time       `json:"until,omitempty"`   // Sleep opcode：唤醒时间（RFC3339）
+	Events  []sendEventIn   `json:"events,omitempty"`  // SendEvent opcode：待扇出事件
+	Event   string          `json:"event,omitempty"`   // WaitForEvent opcode：等待的事件名（必填）
+	Match   string          `json:"match,omitempty"`   // WaitForEvent opcode：可选 match 表达式（expr-lang）
+	Timeout string          `json:"timeout,omitempty"` // WaitForEvent opcode：可选超时（Go duration，如 168h）
 }
 
 // sendEventIn 是 SendEvent opcode 携带的事件（id/ts 可缺省，平台补全）。
@@ -278,6 +281,8 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		log.Printf("executor: run %s sleeping until %s", run.ID, op.Until.Format(time.RFC3339))
 	case "SendEvent":
 		e.handleSendEvent(ctx, item, run, attempt, maxAttempts, op)
+	case "WaitForEvent":
+		e.handleWaitForEvent(ctx, item, run, attempt, maxAttempts, op)
 	case "RunComplete":
 		e.Store.CompleteRun(ctx, run.ID, op.Output)
 		e.Store.CompleteQueueItem(ctx, item.ID)
@@ -337,6 +342,40 @@ func (e *Executor) handleSendEvent(ctx context.Context, item store.QueueItem, ru
 func derivedEventID(runID, stepHash string, i int) string {
 	sum := sha256.Sum256([]byte(runID + ":" + stepHash + ":" + strconv.Itoa(i)))
 	return "evt_" + hex.EncodeToString(sum[:8])
+}
+
+// handleWaitForEvent 处理 WaitForEvent opcode（PRD 8.2 情况4 / FR-2.6）。
+// 与 Sleep 的挂起形态相同，但唤醒不由队列驱动：写 waiting memo + wait 记录后不入队，
+// 挂起期间零占用；事件命中（Runner 路由时）或超时（Runner 定时扫描）时由 Runner
+// 补写 completed memo 并以 at=now 入队恢复。run 保持 Running（Waiting 是其子状态）。
+// (run_id, step_hash) 幂等：崩溃窗口内重试同一 opcode 由 CreateWait 的 INSERT OR IGNORE 去重。
+func (e *Executor) handleWaitForEvent(ctx context.Context, item store.QueueItem, run store.Run, attempt, maxAttempts int, op opcode) {
+	if op.Event == "" {
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "wait_for_event: event name required")
+		return
+	}
+	var expires *time.Time
+	if op.Timeout != "" {
+		d, err := time.ParseDuration(op.Timeout)
+		if err != nil {
+			e.retryOrFail(ctx, item, run, attempt, maxAttempts, "wait_for_event: invalid timeout: "+op.Timeout)
+			return
+		}
+		t := time.Now().Add(d)
+		expires = &t
+	}
+	e.Store.SaveStepResult(ctx, store.StepResult{
+		RunID: run.ID, StepHash: op.ID, StepID: op.StepID, Op: "WaitForEvent",
+		Status: store.StepWaiting, Attempt: attempt})
+	if err := e.Store.CreateWait(ctx, store.Wait{
+		ID: ids.NewID("wait"), RunID: run.ID, StepHash: op.ID, StepID: op.StepID,
+		EventName: op.Event, MatchExpr: op.Match, ExpiresAt: expires, Status: store.WaitWaiting,
+	}); err != nil {
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "wait_for_event: "+err.Error())
+		return
+	}
+	e.Store.CompleteQueueItem(ctx, item.ID)
+	log.Printf("executor: run %s waiting for event %s", run.ID, op.Event)
 }
 
 func (e *Executor) retryOrFail(ctx context.Context, item store.QueueItem, run store.Run, attempt, maxAttempts int, msg string) {

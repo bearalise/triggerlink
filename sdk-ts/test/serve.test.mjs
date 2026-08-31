@@ -178,6 +178,97 @@ test("POST 回调：sendEvent 扇出 → memo 命中直接返回 IDs", async () 
   assert.deepEqual(op.output, { sent: ["evt_a", "custom-1"] });
 });
 
+test("POST 回调：waitForEvent 挂起 → opcode 字段逐一断言（timeout 毫秒转 Go duration）", async () => {
+  const fn = createFunction({ id: "waiter", event: "x/y" }, async ({ step }) => {
+    const ev = await step.waitForEvent("wait-payment", {
+      event: "order/payed",
+      match: "data.order_id == event.data.order_id",
+      timeout: 1500,
+    });
+    return { got: ev };
+  });
+  const { POST } = serve({ client, functions: [fn] });
+
+  const op = await (await POST(execRequest("waiter"))).json();
+  assert.equal(op.op, "WaitForEvent");
+  assert.equal(op.step_id, "wait-payment");
+  assert.ok(op.id); // step_hash
+  assert.equal(op.event, "order/payed");
+  assert.equal(op.match, "data.order_id == event.data.order_id");
+  assert.equal(op.timeout, "1.5s"); // 1500ms → "1.5s"
+});
+
+test("POST 回调：waitForEvent timeout 字符串原样透传，可选字段缺省不出现", async () => {
+  const fn = createFunction({ id: "waiter2", event: "x/y" }, async ({ step }) => {
+    await step.waitForEvent("wait", { event: "order/payed", timeout: "168h" });
+  });
+  const { POST } = serve({ client, functions: [fn] });
+
+  const op = await (await POST(execRequest("waiter2"))).json();
+  assert.equal(op.op, "WaitForEvent");
+  assert.equal(op.timeout, "168h");
+  assert.ok(!("match" in op)); // undefined 被 JSON 序列化省略
+
+  const fn2 = createFunction({ id: "waiter3", event: "x/y" }, async ({ step }) => {
+    await step.waitForEvent("wait", { event: "order/payed" });
+  });
+  const { POST: POST2 } = serve({ client, functions: [fn2] });
+  const op2 = await (await POST2(execRequest("waiter3"))).json();
+  assert.equal(op2.op, "WaitForEvent");
+  assert.ok(!("timeout" in op2) && !("match" in op2));
+});
+
+test("POST 回调：waitForEvent memo 命中返回事件；output=null 返回 null（超时分支）", async () => {
+  const fn = createFunction({ id: "resumer", event: "x/y" }, async ({ step }) => {
+    const ev = await step.waitForEvent("wait-payment", { event: "order/payed" });
+    return { got: ev };
+  });
+  const { POST } = serve({ client, functions: [fn] });
+
+  // 第 1 跳：拿 step_hash
+  let op = await (await POST(execRequest("resumer"))).json();
+  assert.equal(op.op, "WaitForEvent");
+  const h = op.id;
+
+  // 事件命中：memo output = 事件 JSON → 返回事件对象
+  const arrived = { id: "evt_pay", name: "order/payed", data: { order_id: "o1" }, ts: new Date().toISOString() };
+  let steps = { [h]: { id: "wait-payment", status: "completed", output: arrived } };
+  op = await (await POST(execRequest("resumer", steps, 2))).json();
+  assert.equal(op.op, "RunComplete");
+  assert.deepEqual(op.output, { got: arrived });
+
+  // 超时：memo output = JSON null → 返回 null
+  steps = { [h]: { id: "wait-payment", status: "completed", output: null } };
+  op = await (await POST(execRequest("resumer", steps, 3))).json();
+  assert.equal(op.op, "RunComplete");
+  assert.deepEqual(op.output, { got: null });
+});
+
+test("GET manifest：cancelOn 序列化为 cancel_on，无配置则不出现", async () => {
+  const fn = createFunction(
+    {
+      id: "onboarding",
+      event: "user/signup",
+      cancelOn: [
+        { event: "user/deleted", match: "data.user_id == event.data.user_id" },
+        { event: "user/opted-out" },
+      ],
+    },
+    async () => ({}),
+  );
+  const plain = createFunction({ id: "plain", event: "x/y" }, async () => ({}));
+  const { GET } = serve({ client, functions: [fn, plain] });
+
+  const manifest = await (await GET(new Request("http://localhost/api/triggerlink", { headers: signedHeaders() }))).json();
+  const onboarding = manifest.functions.find((f) => f.id === "onboarding");
+  assert.deepEqual(onboarding.cancel_on, [
+    { event: "user/deleted", match: "data.user_id == event.data.user_id" },
+    { event: "user/opted-out" }, // match 缺省被省略
+  ]);
+  const plainFn = manifest.functions.find((f) => f.id === "plain");
+  assert.ok(!("cancel_on" in plainFn));
+});
+
 test("POST 回调：handler 未捕获异常 → RunError", async () => {
   const fn = createFunction({ id: "panics", event: "x/y" }, async () => {
     throw new Error("bug outside step");

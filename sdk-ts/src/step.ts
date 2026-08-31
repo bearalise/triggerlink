@@ -1,5 +1,16 @@
 // step 原语（协议第 5/6 节；对应 Go 的 sdk/step）。
 import { ExecCtx, StepInterrupt, type OutgoingEvent } from "./execx.js";
+import type { TriggerLinkEvent } from "./function.js";
+
+/** step.waitForEvent 的配置。 */
+export interface WaitForEventOpts {
+  /** 等待的事件名（必填） */
+  event: string;
+  /** 可选 expr 表达式；求值环境：data=到达事件 data，event=本 run 触发事件 {name, data} */
+  match?: string;
+  /** 可选超时：Go duration 字符串（如 "168h"）或毫秒数（1500 → "1.5s"）；超时后返回 null */
+  timeout?: string | number;
+}
 
 /** handler 内可用的 step 工具。 */
 export interface StepTool {
@@ -21,6 +32,13 @@ export interface StepTool {
    * memo 语义同 run——恢复重入时直接返回已发事件 ID 列表，不会重复发送。
    */
   sendEvent(id: string, events: OutgoingEvent | OutgoingEvent[]): Promise<string[]>;
+  /**
+   * 挂起当前 run 直至匹配事件到达或超时（协议 5.7 / FR-2.6）：
+   * 事件命中 → 返回该事件；超时 → 返回 null（超时分支）。
+   * 与 sleep 同为挂起原语（恢复重入时 memo 命中直接返回），但唤醒由平台在
+   * 事件路由命中/超时扫描时驱动，挂起期间零占用。
+   */
+  waitForEvent(id: string, opts: WaitForEventOpts): Promise<TriggerLinkEvent | null>;
 }
 
 /** 为一次函数调用构造 step 工具。 */
@@ -63,7 +81,32 @@ export function createStepTool(ec: ExecCtx): StepTool {
       if (list.length === 0) throw new Error(`step.sendEvent "${id}": no events`);
       throw new StepInterrupt({ op: "SendEvent", id: h, step_id: id, events: list });
     },
+    async waitForEvent(id: string, opts: WaitForEventOpts): Promise<TriggerLinkEvent | null> {
+      const h = ec.nextHash(id);
+      const memo = ec.steps[h];
+      if (memo && memo.status === "completed") {
+        if (memo.output == null) return null; // 超时分支：平台以 output=JSON null 完成
+        return memo.output as TriggerLinkEvent;
+      }
+      if (!opts.event) throw new Error(`step.waitForEvent "${id}": event is required`);
+      throw new StepInterrupt({
+        op: "WaitForEvent",
+        id: h,
+        step_id: id,
+        event: opts.event,
+        match: opts.match,
+        timeout: typeof opts.timeout === "number" ? msToGoDuration(opts.timeout) : opts.timeout,
+      });
+    },
   };
+}
+
+/** 毫秒 → Go duration 字符串（协议要求 timeout 为 Go duration，如 1500 → "1.5s"）。 */
+function msToGoDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    throw new Error(`step.waitForEvent: invalid timeout ${ms}`);
+  }
+  return `${ms / 1000}s`;
 }
 
 export function errMessage(err: unknown): string {
