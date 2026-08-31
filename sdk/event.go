@@ -15,8 +15,11 @@ type Event struct {
 }
 
 // Input 是函数处理器的入参。
+// Events 只在批触发（FR-4.7，函数配了 Batch）时非空，按事件到达顺序给出整批；
+// 此时 Event 是其首条，普通函数的 Events 为 nil。
 type Input struct {
-	Event Event
+	Event  Event
+	Events []Event
 }
 
 // CancelOn 是一条取消规则（FR-4.9）：Event 到达且 Match 命中时，平台取消该函数的在途 run。

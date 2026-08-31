@@ -1343,3 +1343,73 @@ func TestThrottleDefersToNextWindow(t *testing.T) {
 	n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted)
 	t.Fatalf("completed=%d after waiting, want 3 (deferred runs must eventually run)", n)
 }
+
+// 批处理端到端（FR-4.7）：攒够 max_size 触发一个 run，handler 通过 Input.Events
+// 拿到整批事件，Input.Event 是首条。
+func TestBatchingBySize(t *testing.T) {
+	got := make(chan []string, 4)
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "bulk-index", Event: "doc/changed",
+			Batch: &triggerlink.Batch{MaxSize: 3, Timeout: time.Hour},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			ids := make([]string, 0, len(in.Events))
+			for _, e := range in.Events {
+				var d struct {
+					Rev int `json:"rev"`
+				}
+				json.Unmarshal(e.Data, &d)
+				ids = append(ids, fmt.Sprintf("%d", d.Rev))
+			}
+			if len(in.Events) > 0 && in.Event.ID != in.Events[0].ID {
+				t.Errorf("ctx.event=%s, want the first batched event %s", in.Event.ID, in.Events[0].ID)
+			}
+			got <- ids
+			return "ok", nil
+		}, nil)
+
+	for rev := 1; rev <= 3; rev++ {
+		st.sendEvent(t, fmt.Sprintf(`{"name":"doc/changed","data":{"rev":%d}}`, rev))
+	}
+	waitStatus(t, st.store, store.RunCompleted)
+
+	select {
+	case batch := <-got:
+		if len(batch) != 3 || batch[0] != "1" || batch[2] != "3" {
+			t.Fatalf("handler saw %v, want [1 2 3] in arrival order", batch)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never ran")
+	}
+	if n, _ := st.store.CountRuns(context.Background()); n != 1 {
+		t.Fatalf("runs=%d, want 1 (three events → one batch run)", n)
+	}
+}
+
+// 攒不满时由 batch.timeout 兜底 flush。
+func TestBatchingByTimeout(t *testing.T) {
+	sizes := make(chan int, 4)
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "bulk-index-timeout", Event: "doc/changed",
+			Batch: &triggerlink.Batch{MaxSize: 100, Timeout: 300 * time.Millisecond},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			sizes <- len(in.Events)
+			return "ok", nil
+		}, nil)
+
+	st.sendEvent(t, `{"name":"doc/changed","data":{"rev":1}}`)
+	st.sendEvent(t, `{"name":"doc/changed","data":{"rev":2}}`)
+
+	select {
+	case n := <-sizes:
+		if n != 2 {
+			t.Fatalf("batch size=%d, want 2 (flushed by timeout, not by size)", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout flush never happened")
+	}
+	waitStatus(t, st.store, store.RunCompleted)
+}

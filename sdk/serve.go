@@ -42,6 +42,7 @@ type callbackRequest struct {
 		FunctionID string                     `json:"function_id"`
 		Attempt    int                        `json:"attempt"`
 		Event      Event                      `json:"event"`
+		Events     []Event                    `json:"events,omitempty"` // 批触发（FR-4.7）：整批事件，Event 为首条
 		Steps      map[string]execx.StepState `json:"steps"`
 	} `json:"ctx"`
 }
@@ -155,7 +156,7 @@ func (h *serveHandler) handleExec(w http.ResponseWriter, r *http.Request) {
 				runErr = fmt.Errorf("panic: %v\n%s", rv, debug.Stack())
 			}
 		}()
-		output, runErr = fn.handler(ctx, Input{Event: req.Ctx.Event})
+		output, runErr = fn.handler(ctx, Input{Event: req.Ctx.Event, Events: req.Ctx.Events})
 	}()
 
 	w.Header().Set("Content-Type", "application/json")

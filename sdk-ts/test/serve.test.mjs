@@ -424,3 +424,44 @@ test("GET manifest：debounce/throttle/batch 序列化（毫秒转 Go duration�
   // key 可选：未给 key 时不出现
   assert.equal("key" in byId.throttled.throttle, false);
 });
+
+test("POST 回调：批触发时 ctx.events 传给 handler，event 为首条；普通触发下不存在", async () => {
+  let batched;
+  let plain;
+  const { POST } = serve({
+    client,
+    functions: [
+      createFunction({ id: "bulk-index", event: "doc/changed" }, async (ctx) => {
+        batched = { events: ctx.events, first: ctx.event.id };
+        return "ok";
+      }),
+      createFunction({ id: "single", event: "doc/changed" }, async (ctx) => {
+        plain = { hasEvents: "events" in ctx, id: ctx.event.id };
+        return "ok";
+      }),
+    ],
+  });
+
+  const events = [
+    { id: "evt_1", name: "doc/changed", data: { rev: 1 }, ts: new Date().toISOString() },
+    { id: "evt_2", name: "doc/changed", data: { rev: 2 }, ts: new Date().toISOString() },
+  ];
+  const payload = JSON.stringify({
+    ctx: { run_id: "run_b1", function_id: "bulk-index", attempt: 1, event: events[0], events, steps: {} },
+  });
+  const body = new TextEncoder().encode(payload);
+  await POST(
+    new Request("http://localhost/api/triggerlink", { method: "POST", headers: signedHeaders(body), body }),
+  );
+  assert.equal(batched.events.length, 2);
+  assert.deepEqual(
+    batched.events.map((e) => e.id),
+    ["evt_1", "evt_2"],
+  );
+  assert.equal(batched.first, "evt_1");
+
+  // 非批触发：回调里没有 events 字段，handler 侧也拿不到
+  await POST(execRequest("single"));
+  assert.equal(plain.hasEvents, false);
+  assert.equal(plain.id, "evt_1");
+});

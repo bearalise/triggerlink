@@ -23,6 +23,11 @@ export interface CancelOnRule {
 /** 传给用户 handler 的上下文。 */
 export interface HandlerContext<T = unknown> {
   event: EventPayload<T>;
+  /**
+   * 批触发（FR-4.7，函数配了 batch）时给出整批事件，按到达顺序；此时 event 是其首条。
+   * 普通触发下不存在该字段。
+   */
+  events?: EventPayload<T>[];
   step: StepTool;
   runId: string;
   attempt: number;

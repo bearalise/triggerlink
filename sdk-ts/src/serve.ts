@@ -23,6 +23,7 @@ interface CallbackRequest {
     function_id: string;
     attempt: number;
     event: EventPayload;
+    events?: EventPayload[]; // 批触发（FR-4.7）：整批事件，event 为其首条
     steps?: Record<string, StepState>;
   };
 }
@@ -131,6 +132,7 @@ function goDuration(v: string | number): string {
     try {
       const output = await fn.handler({
         event: cbReq.ctx.event,
+        ...(cbReq.ctx.events ? { events: cbReq.ctx.events } : {}),
         step,
         runId: cbReq.ctx.run_id,
         attempt: cbReq.ctx.attempt,

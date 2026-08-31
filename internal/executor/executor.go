@@ -134,6 +134,7 @@ type callbackRequest struct {
 		FunctionID string               `json:"function_id"`
 		Attempt    int                  `json:"attempt"`
 		Event      eventPayload         `json:"event"`
+		Events     []eventPayload       `json:"events,omitempty"` // 批触发（FR-4.7）：全部事件，Event 为其首条
 		Steps      map[string]stepState `json:"steps"`
 	} `json:"ctx"`
 }
@@ -251,6 +252,18 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	req.Ctx.FunctionID = run.FunctionID
 	req.Ctx.Attempt = attempt
 	req.Ctx.Event = eventPayload{ID: run.EventID, Name: run.EventName, Data: run.EventData, TS: run.EventTS}
+	if run.Batch {
+		// 批触发的 run：event_data 存的是事件对象数组。ctx.events 给全量，
+		// ctx.event 回填首条（老 SDK 只读 ctx.event，仍能拿到一个结构正确的事件）。
+		var events []eventPayload
+		if err := json.Unmarshal(run.EventData, &events); err != nil || len(events) == 0 {
+			e.retryOrFail(ctx, item, run, attempt, maxAttempts,
+				fmt.Sprintf("decode batch events: %v", err))
+			return
+		}
+		req.Ctx.Events = events
+		req.Ctx.Event = events[0]
+	}
 	req.Ctx.Steps = map[string]stepState{}
 	for h, sr := range steps {
 		if sr.Status == store.StepCompleted {

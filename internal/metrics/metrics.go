@@ -24,6 +24,7 @@ const (
 	ResultPaused       = "paused"        // 函数被暂停（FR-7.3），跳过建 run
 	ResultFiltered     = "filtered"      // 触发 match 表达式（FR-3.1）不命中
 	ResultDebounced    = "debounced"     // 并入已有的防抖窗口（FR-4.5），未新建 run
+	ResultBatched      = "batched"       // 攒进批窗口（FR-4.7），run 在 flush 时才建
 )
 
 // run 终态（RunFinished 的 status 标签）。
@@ -95,7 +96,7 @@ func init() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	// 标签值预置为 0：仪表盘/告警在首次事件之前就能拿到序列（rate() 不至于无数据）。
-	for _, v := range []string{ResultRouted, ResultNoSubscriber, ResultPaused, ResultFiltered, ResultDebounced} {
+	for _, v := range []string{ResultRouted, ResultNoSubscriber, ResultPaused, ResultFiltered, ResultDebounced, ResultBatched} {
 		eventsRouted.WithLabelValues(v)
 	}
 	for _, v := range []string{StatusCompleted, StatusFailed, StatusCancelled, StatusTimeout} {
