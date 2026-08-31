@@ -111,14 +111,20 @@ func TestDelayedEventNotLeasedBeforeTS(t *testing.T) {
 	if len(items) != 0 {
 		t.Fatalf("leased %d items before ts, want 0", len(items))
 	}
-	// 到点后：可租赁
-	items, err = st.LeaseBatch(ctx, future, time.Minute, 4)
-	if err != nil {
-		t.Fatal(err)
+	// 到点后：可租赁。route() 内 CreateRun 先于 Enqueue 提交，waitRuns 返回时
+	// 队列项可能尚未落库（高负载下尤其明显）——轮询等待而非一次性断言。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		items, err = st.LeaseBatch(ctx, future, time.Minute, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if len(items) != 1 {
-		t.Fatalf("leased %d items at ts, want 1", len(items))
-	}
+	t.Fatalf("leased %d items at ts, want 1", len(items))
 }
 
 func TestStartupReconciliation(t *testing.T) {
