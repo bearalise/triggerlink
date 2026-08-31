@@ -1304,3 +1304,42 @@ func TestDebounceKeyIsolation(t *testing.T) {
 	n, _ := st.store.CountRuns(context.Background())
 	t.Fatalf("expected 2 completed runs, got %d runs", n)
 }
+
+// 限流端到端（FR-4.4）：窗口内只放行 limit 个 run 的首次执行，超限的不丢弃，
+// 下一窗口继续跑完。
+func TestThrottleDefersToNextWindow(t *testing.T) {
+	var running atomic.Int32
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "rate-limited", Event: "api/call",
+			Throttle: &triggerlink.Throttle{Limit: 1, Period: 500 * time.Millisecond},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			running.Add(1)
+			return "ok", nil
+		}, nil)
+
+	st.sendEvent(t, `{"name":"api/call","data":{"n":1}}`)
+	st.sendEvent(t, `{"name":"api/call","data":{"n":2}}`)
+	st.sendEvent(t, `{"name":"api/call","data":{"n":3}}`)
+
+	// 第一个窗口内只应有一个 run 完成
+	time.Sleep(250 * time.Millisecond)
+	if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n != 1 {
+		t.Fatalf("completed in first window=%d, want 1 (limit=1)", n)
+	}
+	if total, _ := st.store.CountRuns(context.Background()); total != 3 {
+		t.Fatalf("runs=%d, want 3 (over-limit runs are created, just not executed yet)", total)
+	}
+
+	// 后续窗口把剩下的跑完，一个都不丢
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n == 3 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted)
+	t.Fatalf("completed=%d after waiting, want 3 (deferred runs must eventually run)", n)
+}

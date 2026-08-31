@@ -71,6 +71,11 @@ var (
 		Buckets: []float64{.005, .025, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300},
 	})
 
+	runsThrottled = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "triggerlink_runs_throttled_total",
+		Help: "Dispatch attempts deferred by throttle (FR-4.4); a run over the limit is counted once per deferral.",
+	})
+
 	queueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "triggerlink_queue_depth",
 		Help: "Pending queue items already due (at <= now); sampled periodically, not on scrape.",
@@ -85,7 +90,7 @@ var (
 func init() {
 	reg.MustRegister(
 		eventsReceived, eventsRouted, runsTotal, runDuration,
-		stepDuration, callbackDuration, queueDepth, waitsActive,
+		stepDuration, callbackDuration, runsThrottled, queueDepth, waitsActive,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -128,6 +133,9 @@ func StepObserved(op string, d time.Duration) {
 	}
 	stepDuration.WithLabelValues(op).Observe(d.Seconds())
 }
+
+// RunThrottled 记录一次因限流被推迟的派发（FR-4.4）。
+func RunThrottled() { runsThrottled.Inc() }
 
 // CallbackObserved 记录一次平台→应用回调的往返耗时。
 func CallbackObserved(d time.Duration) { callbackDuration.Observe(d.Seconds()) }

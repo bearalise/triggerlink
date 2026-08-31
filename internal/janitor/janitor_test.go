@@ -9,14 +9,16 @@ import (
 )
 
 type fakeStore struct {
-	mu        sync.Mutex
-	cutoffs   []time.Time
-	runs      int
-	waits     int
-	events    int
-	runsErr   error
-	eventsErr error
-	calls     int
+	mu             sync.Mutex
+	cutoffs        []time.Time
+	throttleCutoff time.Time
+	runs           int
+	waits          int
+	events         int
+	throttles      int
+	runsErr        error
+	eventsErr      error
+	calls          int
 }
 
 func (f *fakeStore) DeleteRunsBefore(_ context.Context, cutoff time.Time) (int, error) {
@@ -33,6 +35,13 @@ func (f *fakeStore) DeleteEventsBefore(context.Context, time.Time) (int, error) 
 
 func (f *fakeStore) DeleteFinishedWaitsBefore(context.Context, time.Time) (int, error) {
 	return f.waits, nil
+}
+
+func (f *fakeStore) DeleteThrottleStateBefore(_ context.Context, cutoff time.Time) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.throttleCutoff = cutoff
+	return f.throttles, nil
 }
 
 func (f *fakeStore) callCount() int {
@@ -55,6 +64,10 @@ func TestCleanUsesRetentionCutoff(t *testing.T) {
 	want := now.Add(-30 * 24 * time.Hour)
 	if !fs.cutoffs[0].Equal(want) {
 		t.Fatalf("cutoff=%v, want %v", fs.cutoffs[0], want)
+	}
+	// 限流配额用独立的 24h 阈值：它不是历史数据，不跟保留期一起留 30 天
+	if wantThrottle := now.Add(-24 * time.Hour); !fs.throttleCutoff.Equal(wantThrottle) {
+		t.Fatalf("throttle cutoff=%v, want %v", fs.throttleCutoff, wantThrottle)
 	}
 }
 

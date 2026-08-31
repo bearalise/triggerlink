@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bearalise/triggerlink/internal/flowkey"
 	"github.com/bearalise/triggerlink/internal/ids"
 	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
@@ -182,6 +183,25 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.failRun(ctx, run, "function not registered: "+run.FunctionID)
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		return
+	}
+	// 限流（FR-4.4）：只拦 run 的首次执行（attempt==0），重试与挂起恢复跳不再占额——
+	// 否则一个长流程会被自己的每一跳反复限流。超限不丢弃，租约延到下一窗口重投。
+	if fn.Throttle != nil && run.Attempt == 0 {
+		key := run.FunctionID + ":" + flowkey.Eval(fn.Throttle.Key, run.EventData, run.EventID)
+		allowed, retryAt, err := e.Store.ReserveThrottleSlot(ctx, key, fn.Throttle.Limit, fn.Throttle.Period, time.Now())
+		if err != nil {
+			slog.Error("throttle reserve failed", "component", "executor",
+				"run_id", run.ID, "function_id", run.FunctionID, "err", err)
+			e.Store.ReleaseLease(ctx, item.ID, time.Now().Add(e.BaseBackoff))
+			return
+		}
+		if !allowed {
+			e.Store.ReleaseLease(ctx, item.ID, retryAt)
+			metrics.RunThrottled()
+			slog.Debug("run throttled", "component", "executor", "run_id", run.ID,
+				"function_id", run.FunctionID, "throttle_key", key, "retry_at", retryAt)
+			return
+		}
 	}
 	// 防抖关窗（FR-4.5）：run 一旦开始派发就释放 (function_id, key)，后续事件重新开窗。
 	// 放在回调之前：合并窗口的语义是"到点执行时的最新快照"，而不是"执行期间还能并入"。

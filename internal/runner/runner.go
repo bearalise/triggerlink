@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bearalise/triggerlink/internal/flowkey"
 	"github.com/bearalise/triggerlink/internal/ids"
 	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
@@ -151,7 +152,7 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 // 队列项已不是 pending，续窗落不到队列上——该事件仍写进了快照，但可能与下一个窗口的
 // run 紧邻产生两个 run。M2 接受这一语义（PRD 记录）。
 func (r *Runner) routeDebounced(ctx context.Context, f registry.Function, e store.Event) (bool, error) {
-	key := evalFlowControlKey(f.Debounce.Key, e)
+	key := flowkey.Eval(f.Debounce.Key, e.Data, e.ID)
 	now := time.Now()
 
 	pending, ok, err := r.Store.GetDebouncePending(ctx, f.ID, key)

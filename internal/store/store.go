@@ -184,6 +184,9 @@ type Store interface {
 	UpsertDebouncePending(ctx context.Context, p DebouncePending) error
 	DeleteDebouncePendingByRun(ctx context.Context, runID string) error
 
+	ReserveThrottleSlot(ctx context.Context, key string, limit int, period time.Duration, now time.Time) (bool, time.Time, error)
+	DeleteThrottleStateBefore(ctx context.Context, cutoff time.Time) (int, error)
+
 	Enqueue(ctx context.Context, item QueueItem) error
 	UpdateQueueItemAt(ctx context.Context, runID string, at time.Time) (int, error)
 	LeaseBatch(ctx context.Context, now time.Time, leaseDur time.Duration, limit int) ([]QueueItem, error)
@@ -309,6 +312,11 @@ CREATE TABLE IF NOT EXISTS debounce_pending (
   PRIMARY KEY (function_id, debounce_key)
 );
 CREATE INDEX IF NOT EXISTS idx_debounce_run ON debounce_pending(run_id);
+CREATE TABLE IF NOT EXISTS throttle_state (
+  constraint_key TEXT PRIMARY KEY,
+  window_start   TEXT NOT NULL,
+  count          INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS paused_functions (
   function_id TEXT PRIMARY KEY,
   paused_at   TEXT NOT NULL
@@ -834,6 +842,70 @@ func (s *SQLiteStore) DeleteDebouncePendingByRun(ctx context.Context, runID stri
 func (s *SQLiteStore) UpdateQueueItemAt(ctx context.Context, runID string, at time.Time) (int, error) {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE queue_items SET at=? WHERE run_id=? AND status=?`, fmtTime(at), runID, QueuePending)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+// --- 限流配额（FR-4.4）---
+
+// ReserveThrottleSlot 在 key 的当前窗口里占一个名额。事务内读改写：
+//   - 无记录或窗口已过期 → 以 now 开新窗口，count=1，放行。
+//   - 窗口内 count < limit → count+1，放行。
+//   - 窗口内已满 → 拒绝，第二个返回值是下一窗口开始时刻（调用方据此延迟重试）。
+//
+// 名额只在 run 首次执行时占用，不随重试/恢复跳重复扣减（由调用方判断）。
+func (s *SQLiteStore) ReserveThrottleSlot(ctx context.Context, key string, limit int, period time.Duration, now time.Time) (bool, time.Time, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	defer tx.Rollback()
+
+	var windowStart string
+	var count int
+	err = tx.QueryRowContext(ctx,
+		`SELECT window_start, count FROM throttle_state WHERE constraint_key=?`, key).
+		Scan(&windowStart, &count)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		windowStart, count = "", 0
+	case err != nil:
+		return false, time.Time{}, err
+	}
+
+	start := time.Time{}
+	if windowStart != "" {
+		if start, err = parseTime(windowStart); err != nil {
+			return false, time.Time{}, err
+		}
+	}
+	expired := windowStart == "" || !now.Before(start.Add(period))
+	if !expired && count >= limit {
+		return false, start.Add(period), nil
+	}
+	if expired {
+		start, count = now, 0
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO throttle_state (constraint_key, window_start, count) VALUES (?,?,?)
+		 ON CONFLICT(constraint_key) DO UPDATE SET window_start=excluded.window_start, count=excluded.count`,
+		key, fmtTime(start), count+1); err != nil {
+		return false, time.Time{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, time.Time{}, err
+	}
+	return true, time.Time{}, nil
+}
+
+// DeleteThrottleStateBefore 删除窗口起点早于 cutoff 的配额记录（高基数 key 的清理）。
+// 早于 cutoff 的窗口必然已过期，下次占额会重新开窗，删掉不影响语义。
+func (s *SQLiteStore) DeleteThrottleStateBefore(ctx context.Context, cutoff time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM throttle_state WHERE window_start<?`, fmtTime(cutoff))
 	if err != nil {
 		return 0, err
 	}

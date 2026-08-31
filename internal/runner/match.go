@@ -5,7 +5,6 @@ package runner
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"sync"
 
@@ -71,29 +70,6 @@ func evalTriggerMatch(exprStr string, arriving store.Event) bool {
 		return false
 	}
 	return hit
-}
-
-// evalFlowControlKey 求值流控分组键（debounce/throttle/batch 的 key，FR-4.4/4.5/4.7）。
-// 环境同 evalTriggerMatch，只含 data。空表达式、编译/求值失败一律归到固定键 ""——
-// 即整个函数共用一个窗口，宁可合并过头也不要因为表达式笔误把流控整个绕过。
-func evalFlowControlKey(exprStr string, e store.Event) string {
-	if exprStr == "" {
-		return ""
-	}
-	prog, err := compileMatch(exprStr)
-	if err != nil {
-		slog.Warn("flow-control key compile failed", "component", "runner", "expr", exprStr, "err", err)
-		return ""
-	}
-	out, err := expr.Run(prog, map[string]any{"data": jsonToAny(e.Data)})
-	if err != nil {
-		slog.Warn("flow-control key eval failed", "component", "runner", "expr", exprStr, "event_id", e.ID, "err", err)
-		return ""
-	}
-	if out == nil {
-		return ""
-	}
-	return fmt.Sprintf("%v", out)
 }
 
 func compileMatch(exprStr string) (*vm.Program, error) {
