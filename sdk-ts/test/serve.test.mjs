@@ -384,3 +384,43 @@ test("POST 回调：未知函数 404，过期签名 401", async () => {
   });
   assert.equal((await POST(req)).status, 401);
 });
+
+test("GET manifest：debounce/throttle/batch 序列化（毫秒转 Go duration，maxSize→max_size）", async () => {
+  const { GET } = serve({
+    client,
+    functions: [
+      createFunction(
+        {
+          id: "debounced",
+          event: "doc/changed",
+          debounce: { period: 5000, key: "data.doc_id", timeout: "1h" },
+        },
+        async () => "ok",
+      ),
+      createFunction(
+        { id: "throttled", event: "doc/changed", throttle: { limit: 10, period: "1m" } },
+        async () => "ok",
+      ),
+      createFunction(
+        { id: "batched", event: "doc/changed", batch: { maxSize: 100, timeout: 30000 } },
+        async () => "ok",
+      ),
+      createFunction({ id: "plain", event: "doc/changed" }, async () => "ok"),
+    ],
+  });
+
+  const manifest = await (
+    await GET(new Request("http://localhost/api/triggerlink", { headers: signedHeaders() }))
+  ).json();
+  const byId = Object.fromEntries(manifest.functions.map((f) => [f.id, f]));
+
+  assert.deepEqual(byId.debounced.debounce, { period: "5s", key: "data.doc_id", timeout: "1h" });
+  assert.deepEqual(byId.throttled.throttle, { limit: 10, period: "1m" });
+  assert.deepEqual(byId.batched.batch, { max_size: 100, timeout: "30s" });
+  // 未配置的函数不出现这三个字段
+  assert.equal("debounce" in byId.plain, false);
+  assert.equal("throttle" in byId.plain, false);
+  assert.equal("batch" in byId.plain, false);
+  // key 可选：未给 key 时不出现
+  assert.equal("key" in byId.throttled.throttle, false);
+});

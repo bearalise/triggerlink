@@ -69,6 +69,12 @@ At startup, the platform sends one signed GET (no body) to each configured `-app
 | `functions[].cancel_on` | array | Optional cancel rules: `[{"event": "user/deleted", "match": "data.user_id == event.data.user_id"}]`. When the named event arrives and `match` evaluates true, the platform cancels that function's in-flight (Queued/Running) runs; an omitted `match` means "cancel on arrival". `match` is an expr-lang expression evaluated with `data` = the arriving event's `data` and `event` = the run's triggering event `{"name", "data"}` |
 | `functions[].timeout` | string | Optional run-level timeout (FR-4.3) as a Go duration string (e.g. `"5m"`, `"168h"`), omitted when unset. If a run is still Queued/Running this long after creation, the platform marks it `Failed` and emits `triggerlink/run.failed` (so the function's `onFailure` handler fires, Section 3.2). Absent = no time limit |
 
+| `functions[].debounce` | object | Optional debounce config (FR-4.5): `{"period": "5m", "key": "data.doc_id", "timeout": "1h"}`. `period` (Go duration, required) is the merge window — each new event in the window pushes the trigger back by another `period`; `key` (optional expr-lang expression over `data`) groups events into independent windows, absent = one window for the whole function; `timeout` (optional Go duration) caps the total delay from the first event |
+| `functions[].throttle` | object | Optional throttle config (FR-4.4): `{"limit": 10, "period": "1m", "key": "data.tenant"}`. At most `limit` runs start their first execution per `period` window per key; runs over the limit are delayed to the next window, never dropped. `limit` and `period` are required |
+| `functions[].batch` | object | Optional batching config (FR-4.7): `{"max_size": 100, "timeout": "30s", "key": "data.tenant"}`. Events accumulate per key until `max_size` is reached or `timeout` elapses since the first event, then trigger one run carrying the whole array. Both `max_size` and `timeout` are required — without `timeout` a partial batch would never flush |
+
+A malformed flow-control object (bad duration, non-positive `limit`/`max_size`, missing required field) is logged and treated as *unset* for that function; the rest of the manifest still registers. `debounce` and `batch` both act at the routing layer; when both are set, `debounce` wins.
+
 Non-200 response or timeout: the platform logs a warning and skips that app (non-fatal; other apps register as usual).
 
 ### 3.1 Cron Trigger Behavior

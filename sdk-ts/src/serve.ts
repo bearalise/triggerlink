@@ -49,6 +49,11 @@ export function serve(opts: ServeOptions) {
     }
   }
 
+/** 流控配置的时长字段：毫秒数转 Go duration 字符串，字符串原样透传（协议要求 Go duration）。 */
+function goDuration(v: string | number): string {
+  return typeof v === "number" ? msToGoDuration(v, "createFunction") : v;
+}
+
   async function GET(req: Request): Promise<Response> {
     if (!verifySignature(opts.client.signingKey, req.headers.get(SIGNATURE_HEADER), new Uint8Array(0))) {
       return json({ error: "unauthorized" }, 401);
@@ -71,6 +76,33 @@ export function serve(opts: ServeOptions) {
                 typeof f.opts.timeout === "number"
                   ? msToGoDuration(f.opts.timeout, "createFunction")
                   : f.opts.timeout,
+            }
+          : {}),
+        ...(f.opts.debounce
+          ? {
+              debounce: {
+                period: goDuration(f.opts.debounce.period),
+                ...(f.opts.debounce.key ? { key: f.opts.debounce.key } : {}),
+                ...(f.opts.debounce.timeout ? { timeout: goDuration(f.opts.debounce.timeout) } : {}),
+              },
+            }
+          : {}),
+        ...(f.opts.throttle
+          ? {
+              throttle: {
+                limit: f.opts.throttle.limit,
+                period: goDuration(f.opts.throttle.period),
+                ...(f.opts.throttle.key ? { key: f.opts.throttle.key } : {}),
+              },
+            }
+          : {}),
+        ...(f.opts.batch
+          ? {
+              batch: {
+                max_size: f.opts.batch.maxSize,
+                timeout: goDuration(f.opts.batch.timeout),
+                ...(f.opts.batch.key ? { key: f.opts.batch.key } : {}),
+              },
             }
           : {}),
       })),

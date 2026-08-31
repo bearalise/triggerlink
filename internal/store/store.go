@@ -117,6 +117,11 @@ type RegisteredFunction struct {
 	Retries  int
 	CancelOn string
 	Timeout  time.Duration
+	// 流控配置（FR-4.4/4.5/4.7）的 JSON 序列化形态，空串表示未配置。
+	// 存原样 JSON 而非拆列：清单形态与落库形态一致，加字段无需再迁移。
+	Debounce string
+	Throttle string
+	Batch    string
 }
 
 // QueueItem 是队列中的待执行单元；score 决定 FIFO 顺序，at 是"不早于"时间（退避用）。
@@ -304,7 +309,15 @@ CREATE TABLE IF NOT EXISTS webhooks (
 	if err := ensureColumn(db, "functions", "cron", "TEXT"); err != nil {
 		return err
 	}
-	return ensureColumn(db, "functions", "timeout", "TEXT")
+	if err := ensureColumn(db, "functions", "timeout", "TEXT"); err != nil {
+		return err
+	}
+	for _, col := range []string{"debounce", "throttle", "batch"} {
+		if err := ensureColumn(db, "functions", col, "TEXT"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ensureColumn 给已存在的表补列（SQLite 无 ADD COLUMN IF NOT EXISTS，先查 PRAGMA）。
@@ -850,11 +863,15 @@ func (s *SQLiteStore) ReplaceAppFunctions(ctx context.Context, appURL string, fn
 			timeout = f.Timeout.String()
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO functions (id, app_url, event, match, cron, retries, cancel_on, timeout, updated_at) VALUES (?,?,?,?,?,?,?,?,?)
+			`INSERT INTO functions (id, app_url, event, match, cron, retries, cancel_on, timeout, debounce, throttle, batch, updated_at)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET
 			   app_url=excluded.app_url, event=excluded.event, match=excluded.match, cron=excluded.cron,
-			   retries=excluded.retries, cancel_on=excluded.cancel_on, timeout=excluded.timeout, updated_at=excluded.updated_at`,
-			f.ID, appURL, f.Event, f.Match, f.Cron, f.Retries, f.CancelOn, timeout, now); err != nil {
+			   retries=excluded.retries, cancel_on=excluded.cancel_on, timeout=excluded.timeout,
+			   debounce=excluded.debounce, throttle=excluded.throttle, batch=excluded.batch,
+			   updated_at=excluded.updated_at`,
+			f.ID, appURL, f.Event, f.Match, f.Cron, f.Retries, f.CancelOn, timeout,
+			f.Debounce, f.Throttle, f.Batch, now); err != nil {
 			return err
 		}
 	}
@@ -864,7 +881,8 @@ func (s *SQLiteStore) ReplaceAppFunctions(ctx context.Context, appURL string, fn
 // LoadRegisteredFunctions 返回全部持久化的函数注册记录（启动恢复用），按 app_url, id 排序。
 func (s *SQLiteStore) LoadRegisteredFunctions(ctx context.Context) ([]RegisteredFunction, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, app_url, event, COALESCE(match, ''), COALESCE(cron, ''), retries, COALESCE(cancel_on, ''), COALESCE(timeout, '')
+		`SELECT id, app_url, event, COALESCE(match, ''), COALESCE(cron, ''), retries, COALESCE(cancel_on, ''), COALESCE(timeout, ''),
+		        COALESCE(debounce, ''), COALESCE(throttle, ''), COALESCE(batch, '')
 		 FROM functions ORDER BY app_url, id`)
 	if err != nil {
 		return nil, err
@@ -874,7 +892,8 @@ func (s *SQLiteStore) LoadRegisteredFunctions(ctx context.Context) ([]Registered
 	for rows.Next() {
 		var f RegisteredFunction
 		var timeout string
-		if err := rows.Scan(&f.ID, &f.AppURL, &f.Event, &f.Match, &f.Cron, &f.Retries, &f.CancelOn, &timeout); err != nil {
+		if err := rows.Scan(&f.ID, &f.AppURL, &f.Event, &f.Match, &f.Cron, &f.Retries, &f.CancelOn, &timeout,
+			&f.Debounce, &f.Throttle, &f.Batch); err != nil {
 			return nil, err
 		}
 		if timeout != "" {
