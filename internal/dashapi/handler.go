@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/store"
 )
@@ -312,6 +313,7 @@ func (h *Handler) cancelRun(w http.ResponseWriter, r *http.Request, id string) {
 		writeErr(w, http.StatusInternalServerError, "get run")
 		return
 	}
+	metrics.RunFinished(metrics.StatusCancelled, time.Since(run.CreatedAt))
 	writeJSON(w, http.StatusOK, map[string]any{"run": toRunDTO(run)})
 }
 

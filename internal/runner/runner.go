@@ -8,10 +8,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/store"
 )
@@ -34,11 +35,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	for _, e := range orphans {
 		if err := r.route(ctx, e); err != nil {
-			log.Printf("runner: reconcile route %s: %v", e.ID, err)
+			slog.Error("reconcile route failed", "component", "runner", "event_id", e.ID, "err", err)
 		}
 	}
 	if len(orphans) > 0 {
-		log.Printf("runner: reconciled %d unrouted events", len(orphans))
+		slog.Info("reconciled unrouted events", "component", "runner", "count", len(orphans))
 	}
 
 	interval := r.PollInterval
@@ -55,23 +56,30 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.scanWaitTimeouts(ctx)
 		case e := <-r.Stream:
 			if err := r.route(ctx, e); err != nil {
-				log.Printf("runner: route %s: %v", e.ID, err)
+				slog.Error("route failed", "component", "runner", "event_id", e.ID, "err", err)
 			}
 		}
 	}
 }
 
 func (r *Runner) route(ctx context.Context, e store.Event) error {
-	for _, f := range r.Reg.Match(e.Name) {
+	routed := 0
+	subscribers := r.Reg.Match(e.Name)
+	if len(subscribers) == 0 {
+		metrics.EventRouted(metrics.ResultNoSubscriber)
+	}
+	for _, f := range subscribers {
 		// 暂停的函数不接新触发（FR-7.3）：跳过建 run；事件仍照常标记 routed。
 		// 查询失败时 fail-open（不跳过），避免存储抖动导致触发丢失。
 		if paused, err := r.Store.IsFunctionPaused(ctx, f.ID); err != nil {
-			log.Printf("runner: check paused %s: %v", f.ID, err)
+			slog.Warn("check paused failed", "component", "runner", "function_id", f.ID, "err", err)
 		} else if paused {
+			metrics.EventRouted(metrics.ResultPaused)
 			continue
 		}
 		// 事件触发 match（FR-3.1）：非空且不命中（含编译/求值失败）则不为该函数建 run。
 		if !evalTriggerMatch(f.Match, e) {
+			metrics.EventRouted(metrics.ResultFiltered)
 			continue
 		}
 		// run ID 由 (event_id, function_id) 确定性派生：对账扫描与 stream 消费重叠导致
@@ -92,6 +100,8 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 		if !created {
 			continue
 		}
+		routed++
+		metrics.EventRouted(metrics.ResultRouted)
 		// 延迟事件（FR-1.6）：ts 为未来时间时，到点前不出队触发。
 		at := time.Now()
 		if e.TS.After(at) {
@@ -108,12 +118,13 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 			return err
 		}
 	}
+	slog.Debug("event routed", "component", "runner", "event_id", e.ID, "event", e.Name, "runs", routed)
 	// waitForEvent 恢复与 cancelOn 取消：失败只记日志，不影响事件路由落账。
 	if err := r.resumeWaits(ctx, e); err != nil {
-		log.Printf("runner: resume waits on %s: %v", e.ID, err)
+		slog.Error("resume waits failed", "component", "runner", "event_id", e.ID, "err", err)
 	}
 	if err := r.applyCancelOn(ctx, e); err != nil {
-		log.Printf("runner: cancelOn on %s: %v", e.ID, err)
+		slog.Error("cancel_on failed", "component", "runner", "event_id", e.ID, "err", err)
 	}
 	return r.Store.MarkEventRouted(ctx, e.ID)
 }
@@ -129,7 +140,7 @@ func (r *Runner) resumeWaits(ctx context.Context, e store.Event) error {
 	for _, w := range waits {
 		run, err := r.Store.GetRun(ctx, w.RunID)
 		if err != nil {
-			log.Printf("runner: wait %s get run %s: %v", w.ID, w.RunID, err)
+			slog.Error("get run for wait failed", "component", "runner", "wait_id", w.ID, "run_id", w.RunID, "err", err)
 			continue
 		}
 		if isTerminal(run.Status) {
@@ -143,15 +154,16 @@ func (r *Runner) resumeWaits(ctx context.Context, e store.Event) error {
 		if err := r.Store.SaveStepResult(ctx, store.StepResult{
 			RunID: w.RunID, StepHash: w.StepHash, StepID: w.StepID, Op: "WaitForEvent",
 			Status: store.StepCompleted, Output: out}); err != nil {
-			log.Printf("runner: resume wait %s save step: %v", w.ID, err)
+			slog.Error("resume wait save step failed", "component", "runner", "wait_id", w.ID, "run_id", w.RunID, "err", err)
 			continue
 		}
 		if err := r.Store.SetWaitStatus(ctx, w.ID, store.WaitResolved); err != nil {
-			log.Printf("runner: resume wait %s: %v", w.ID, err)
+			slog.Error("resume wait failed", "component", "runner", "wait_id", w.ID, "run_id", w.RunID, "err", err)
 			continue
 		}
+		metrics.StepObserved("WaitForEvent", time.Since(w.CreatedAt))
 		r.enqueueResume(ctx, run)
-		log.Printf("runner: run %s resumed by event %s (wait %s)", run.ID, e.ID, w.ID)
+		slog.Info("run resumed by event", "component", "runner", "run_id", run.ID, "function_id", run.FunctionID, "event_id", e.ID, "wait_id", w.ID)
 	}
 	return nil
 }
@@ -160,13 +172,13 @@ func (r *Runner) resumeWaits(ctx context.Context, e store.Event) error {
 func (r *Runner) scanWaitTimeouts(ctx context.Context) {
 	waits, err := r.Store.ExpiredWaits(ctx, time.Now())
 	if err != nil {
-		log.Printf("runner: scan wait timeouts: %v", err)
+		slog.Error("scan wait timeouts failed", "component", "runner", "err", err)
 		return
 	}
 	for _, w := range waits {
 		run, err := r.Store.GetRun(ctx, w.RunID)
 		if err != nil {
-			log.Printf("runner: wait %s get run %s: %v", w.ID, w.RunID, err)
+			slog.Error("get run for wait failed", "component", "runner", "wait_id", w.ID, "run_id", w.RunID, "err", err)
 			continue
 		}
 		if isTerminal(run.Status) {
@@ -176,15 +188,16 @@ func (r *Runner) scanWaitTimeouts(ctx context.Context) {
 		if err := r.Store.SaveStepResult(ctx, store.StepResult{
 			RunID: w.RunID, StepHash: w.StepHash, StepID: w.StepID, Op: "WaitForEvent",
 			Status: store.StepCompleted, Output: json.RawMessage("null")}); err != nil {
-			log.Printf("runner: timeout wait %s save step: %v", w.ID, err)
+			slog.Error("timeout wait save step failed", "component", "runner", "wait_id", w.ID, "run_id", w.RunID, "err", err)
 			continue
 		}
 		if err := r.Store.SetWaitStatus(ctx, w.ID, store.WaitTimeout); err != nil {
-			log.Printf("runner: timeout wait %s: %v", w.ID, err)
+			slog.Error("timeout wait failed", "component", "runner", "wait_id", w.ID, "run_id", w.RunID, "err", err)
 			continue
 		}
+		metrics.StepObserved("WaitForEvent", time.Since(w.CreatedAt))
 		r.enqueueResume(ctx, run)
-		log.Printf("runner: run %s wait %s timed out", run.ID, w.ID)
+		slog.Info("wait timed out", "component", "runner", "run_id", run.ID, "function_id", run.FunctionID, "wait_id", w.ID)
 	}
 }
 
@@ -200,12 +213,13 @@ func (r *Runner) applyCancelOn(ctx context.Context, e store.Event) error {
 			if cancelMatchHit(f, e, run) {
 				cancelled, err := r.Store.CancelRun(ctx, run.ID)
 				if err != nil {
-					log.Printf("runner: cancelOn cancel run %s: %v", run.ID, err)
+					slog.Error("cancel_on cancel run failed", "component", "runner", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 					continue
 				}
 				if cancelled {
+					metrics.RunFinished(metrics.StatusCancelled, time.Since(run.CreatedAt))
 					r.Store.CancelWaitsForRun(ctx, run.ID)
-					log.Printf("runner: run %s cancelled by cancelOn event %s", run.ID, e.ID)
+					slog.Info("run cancelled by cancel_on", "component", "runner", "run_id", run.ID, "function_id", run.FunctionID, "event_id", e.ID)
 				}
 			}
 		}
@@ -233,7 +247,7 @@ func (r *Runner) enqueueResume(ctx context.Context, run store.Run) {
 		At:         time.Now(),
 		Status:     store.QueuePending,
 	}); err != nil {
-		log.Printf("runner: enqueue resume for run %s: %v", run.ID, err)
+		slog.Error("enqueue resume failed", "component", "runner", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 	}
 }
 

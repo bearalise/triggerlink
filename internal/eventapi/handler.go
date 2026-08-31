@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/store"
 )
 
@@ -92,6 +93,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		idsOut = append(idsOut, in.ID)
 	}
 
+	metrics.EventReceived(len(idsOut))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ids": idsOut, "status": 200})
 }

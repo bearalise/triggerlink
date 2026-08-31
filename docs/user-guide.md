@@ -112,6 +112,8 @@ Flag reference:
 | `-event-key` | (required for `start`) | Bearer key for producers calling `POST /v1/events` |
 | `-signing-key` | (required for `start`) | HMAC signing key used when the platform calls back applications; **must match the application's `SigningKey`** |
 | `-app` | none | Application serve URL; repeat to connect multiple applications |
+| `-retention-days` | `30` | Days of history kept (terminal runs + their steps/waits, events, resolved waits); env `TRIGGERLINK_RETENTION_DAYS` is used when the flag is `0`. A negative value disables cleanup. Values below 1 day are rejected at startup — they would delete events still inside the 24h dedup window. |
+| `-log-level` | `info` | Structured-log level: `debug` / `info` / `warn` / `error`; env `TRIGGERLINK_LOG_LEVEL` is used when the flag is empty. Unknown values fall back to `info` with a warning. |
 
 Notes:
 
@@ -594,7 +596,10 @@ On "self-registration" in step 1: it is purely a local-development convenience (
 
 ## 8. Operations and Troubleshooting
 
-- **Platform logs**: registration (`registered function ...`), reconciliation (`reconciled N ...`), and every retry and termination are logged — when troubleshooting, look at the platform output first.
+- **Platform logs**: logs are structured key/value lines (Go `log/slog` text handler) written to stderr, e.g. `level=INFO msg="run completed" component=executor run_id=run_... function_id=... attempt=1 duration=1.2s`. Registration (`msg="registered function"`), reconciliation (`msg="reconciled unrouted events"`), and every retry and termination are logged — when troubleshooting, look at the platform output first. Common fields: `component`, `run_id`, `function_id`, `event_id`, `attempt`, `duration`, `err`.
+- **Data retention**: a background janitor runs hourly (and once at startup) deleting terminal runs whose `ended_at` is older than `-retention-days`, together with their steps, waits, and any leftover queue items; events older than the cutoff go too, except those still referenced by a `Queued`/`Running` run. In-flight data is never deleted, and run detail pages keep working after their triggering event is gone (each run stores its own event snapshot).
+- **Metrics**: `GET /metrics` serves Prometheus text format (public path, no basic auth) — event intake, routing outcomes, terminal run counts and durations, callback latency, queue depth, and active waits. See the Metrics section of the [Deployment Guide](deployment.md) for the full series list.
+- **Turning up log detail**: start with `-log-level=debug` (or `TRIGGERLINK_LOG_LEVEL=debug`) to also see per-event routing (`msg="event routed"`), callback round-trip durations, and step-level suspend/resume lines (sleep / waitForEvent / sendEvent).
 - **Debugging "the event didn't trigger"**: check in order: ① the producer received a 200; ② the function appears as registered in the platform startup logs (did the application start before the platform?); ③ the event name matches the function's `Event` exactly; ④ whether that event ID was already sent before (idempotent deduplication).
 - **Inspecting state**: use the built-in Dashboard (`http://localhost:8288/dashboard`, see the Dashboard section above) or the read-only admin API; you can also query SQLite directly:
   ```bash

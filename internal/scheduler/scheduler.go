@@ -8,7 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -87,13 +87,13 @@ func (s *Scheduler) check(ctx context.Context, now time.Time) {
 	for _, f := range s.Reg.CronFunctions() {
 		// 暂停的函数不接新触发（FR-7.3）：cron 到点同样跳过；查询失败 fail-open。
 		if paused, err := s.Store.IsFunctionPaused(ctx, f.ID); err != nil {
-			log.Printf("scheduler: check paused %s: %v", f.ID, err)
+			slog.Warn("check paused failed", "component", "scheduler", "function_id", f.ID, "err", err)
 		} else if paused {
 			continue
 		}
 		sched, err := s.scheduleFor(f)
 		if err != nil {
-			log.Printf("scheduler: cron parse %q (function %s): %v", f.Cron, f.ID, err)
+			slog.Warn("cron parse failed", "component", "scheduler", "cron", f.Cron, "function_id", f.ID, "err", err)
 			continue
 		}
 		if next := sched.Next(last); !next.After(now) {
@@ -141,7 +141,7 @@ func (s *Scheduler) fire(ctx context.Context, f registry.Function, at time.Time)
 		EventTS:    at,
 	})
 	if err != nil {
-		log.Printf("scheduler: create run for %s: %v", f.ID, err)
+		slog.Error("create cron run failed", "component", "scheduler", "function_id", f.ID, "err", err)
 		return
 	}
 	if !created {
@@ -155,9 +155,9 @@ func (s *Scheduler) fire(ctx context.Context, f registry.Function, at time.Time)
 		At:         time.Now(),
 		Status:     store.QueuePending,
 	}); err != nil {
-		log.Printf("scheduler: enqueue run %s: %v", runID, err)
+		slog.Error("enqueue cron run failed", "component", "scheduler", "run_id", runID, "function_id", f.ID, "err", err)
 		return
 	}
-	log.Printf("scheduler: run %s fired for function %s (cron %q, at %s)",
-		runID, f.ID, f.Cron, at.Format(time.RFC3339))
+	slog.Info("cron run fired", "component", "scheduler",
+		"run_id", runID, "function_id", f.ID, "cron", f.Cron, "at", at.Format(time.RFC3339))
 }

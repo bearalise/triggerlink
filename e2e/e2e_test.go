@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/bearalise/triggerlink/internal/eventapi"
 	"github.com/bearalise/triggerlink/internal/executor"
 	"github.com/bearalise/triggerlink/internal/ids"
+	"github.com/bearalise/triggerlink/internal/metrics"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/runner"
 	"github.com/bearalise/triggerlink/internal/scheduler"
@@ -55,7 +57,7 @@ func startStackFns(t *testing.T, fns []*triggerlink.Function,
 }
 
 // startStackFull 与 startStackFns 同，tweakExec 非 nil 时在 executor 启动前调整其配置
-//（如调小 TimeoutScanInterval 加速 run 超时扫描）。
+// （如调小 TimeoutScanInterval 加速 run 超时扫描）。
 func startStackFull(t *testing.T, fns []*triggerlink.Function,
 	beforeStart func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string),
 	tweakExec func(*executor.Executor)) (*stack, *registry.Registry, string) {
@@ -82,7 +84,7 @@ func startStackFull(t *testing.T, fns []*triggerlink.Function,
 		MaxRetries: 4, Concurrency: 10, BatchSize: 4,
 		PollInterval: 5 * time.Millisecond, LeaseDuration: 30 * time.Second,
 		BaseBackoff: 10 * time.Millisecond,
-		Stream: stream,
+		Stream:      stream,
 	}
 	if tweakExec != nil {
 		tweakExec(exec)
@@ -575,7 +577,7 @@ func TestRegistrationSurvivesRestart(t *testing.T) {
 		MaxRetries: 4, Concurrency: 10, BatchSize: 4,
 		PollInterval: 5 * time.Millisecond, LeaseDuration: 30 * time.Second,
 		BaseBackoff: 10 * time.Millisecond,
-		Stream: stream,
+		Stream:      stream,
 	}
 	go rnr.Run(runCtx)
 	go exec.Run(runCtx)
@@ -903,7 +905,7 @@ func TestCronTrigger(t *testing.T) {
 }
 
 // registerApp 是 startStackRaw/startStackFull 的 beforeStart：内省 app 并同步注册表
-//（runner 启动前完成，与 startStack 的注册路径一致）。
+// （runner 启动前完成，与 startStack 的注册路径一致）。
 func registerApp(t *testing.T) func(context.Context, *store.SQLiteStore, *registry.Registry, string) {
 	t.Helper()
 	return func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string) {
@@ -1017,7 +1019,7 @@ func TestPauseResumeFunction(t *testing.T) {
 
 // TestRunTimeout：函数配 Timeout=2s，handler 在 step A 后 Sleep(30s) 挂起 →
 // run 从 created_at 起超时仍在 Running → 平台置 Failed，error 含 "run timeout"
-//（FR-4.3）。TimeoutScanInterval 调小到 10ms 加速扫描；Timeout 取 2s 以容忍
+// （FR-4.3）。TimeoutScanInterval 调小到 10ms 加速扫描；Timeout 取 2s 以容忍
 // 全量测试负载下首个回调的调度延迟（300ms 在高负载时会在回调发生前误杀 run）。
 func TestRunTimeout(t *testing.T) {
 	var aCount atomic.Int32
@@ -1134,5 +1136,87 @@ func TestWebhookTrigger(t *testing.T) {
 	}
 	if string(run.EventData) != body || run.EventName != "stripe/payment" {
 		t.Fatalf("run event snapshot: %+v", run)
+	}
+}
+
+// scrapeMetric 抓一次 /metrics 并取出某条序列的值（样本行完全匹配 name+labels）。
+// 序列不存在时返回 0：counter 未被触碰过与值为 0 在断言增量时等价。
+func scrapeMetric(t *testing.T, series string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics status=%d", rec.Code)
+	}
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, series+" ") {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, series+" ")), 64)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		return v
+	}
+	return 0
+}
+
+// 一条完整流水线跑完后，/metrics 上的接收/路由/终态计数与队列 gauge 都应随之变化（FR-6.4）。
+func TestMetricsEndToEnd(t *testing.T) {
+	before := map[string]float64{}
+	series := []string{
+		"triggerlink_events_received_total",
+		`triggerlink_events_routed_total{result="routed"}`,
+		`triggerlink_events_routed_total{result="filtered"}`,
+		`triggerlink_runs_total{status="completed"}`,
+		"triggerlink_run_duration_seconds_count",
+		`triggerlink_step_duration_seconds_count{op="Run"}`,
+		"triggerlink_callback_duration_seconds_count",
+	}
+	for _, s := range series {
+		before[s] = scrapeMetric(t, s)
+	}
+
+	st := startStack(t,
+		// match 表达式：只处理 doc_id=d1 的事件，另一条走 filtered 分支
+		triggerlink.FunctionOpts{ID: "metrics-fn", Event: "doc/uploaded", Match: `data.doc_id == "d1"`},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			return step.Run(ctx, "work", func(ctx context.Context) (string, error) { return "ok", nil })
+		}, nil)
+	st.sendEvent(t, `{"name":"doc/uploaded","data":{"doc_id":"d1"}}`)
+	st.sendEvent(t, `{"name":"doc/uploaded","data":{"doc_id":"other"}}`)
+	waitStatus(t, st.store, store.RunCompleted)
+
+	delta := func(s string) float64 { return scrapeMetric(t, s) - before[s] }
+	if d := delta("triggerlink_events_received_total"); d != 2 {
+		t.Fatalf("events_received delta=%v, want 2", d)
+	}
+	if d := delta(`triggerlink_events_routed_total{result="routed"}`); d != 1 {
+		t.Fatalf("events_routed{routed} delta=%v, want 1", d)
+	}
+	if d := delta(`triggerlink_events_routed_total{result="filtered"}`); d != 1 {
+		t.Fatalf("events_routed{filtered} delta=%v, want 1", d)
+	}
+	if d := delta(`triggerlink_runs_total{status="completed"}`); d != 1 {
+		t.Fatalf("runs_total{completed} delta=%v, want 1", d)
+	}
+	if d := delta("triggerlink_run_duration_seconds_count"); d != 1 {
+		t.Fatalf("run_duration samples delta=%v, want 1", d)
+	}
+	// 该函数一个 step，run 走两跳回调（step 完成一跳 + 函数返回一跳）
+	if d := delta(`triggerlink_step_duration_seconds_count{op="Run"}`); d != 1 {
+		t.Fatalf("step_duration{Run} delta=%v, want 1", d)
+	}
+	if d := delta("triggerlink_callback_duration_seconds_count"); d < 2 {
+		t.Fatalf("callback_duration delta=%v, want >= 2", d)
+	}
+
+	// gauge 由采样器驱动：队列已排空，采样后应为 0
+	metrics.Sample(context.Background(), st.store)
+	if v := scrapeMetric(t, "triggerlink_queue_depth"); v != 0 {
+		t.Fatalf("queue_depth=%v, want 0 after drain", v)
+	}
+	if v := scrapeMetric(t, "triggerlink_waits_active"); v != 0 {
+		t.Fatalf("waits_active=%v, want 0", v)
 	}
 }
