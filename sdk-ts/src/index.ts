@@ -14,7 +14,9 @@ export {
   type FunctionOpts,
   type HandlerContext,
   type EventPayload,
+  type TriggerLinkEvent,
+  type CancelOnRule,
 } from "./function.js";
 export { serve, sdkVersion, type ServeOptions } from "./serve.js";
 export { StepInterrupt, type Opcode, type StepState, type OutgoingEvent } from "./execx.js";
-export type { StepTool } from "./step.js";
+export type { StepTool, WaitForEventOpts } from "./step.js";

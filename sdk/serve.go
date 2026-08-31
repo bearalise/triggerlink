@@ -55,13 +55,14 @@ func (h *serveHandler) handleManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type fnInfo struct {
-		ID      string `json:"id"`
-		Event   string `json:"event"`
-		Retries int    `json:"retries"`
+		ID       string     `json:"id"`
+		Event    string     `json:"event"`
+		Retries  int        `json:"retries"`
+		CancelOn []CancelOn `json:"cancel_on,omitempty"`
 	}
 	fns := make([]fnInfo, 0, len(h.byID))
 	for _, f := range h.byID {
-		fns = append(fns, fnInfo{ID: f.opts.ID, Event: f.opts.Event, Retries: f.opts.Retries})
+		fns = append(fns, fnInfo{ID: f.opts.ID, Event: f.opts.Event, Retries: f.opts.Retries, CancelOn: f.opts.CancelOn})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

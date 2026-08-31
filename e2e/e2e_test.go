@@ -128,6 +128,19 @@ func waitStatus(t *testing.T, st *store.SQLiteStore, want string) {
 	t.Fatalf("no run reached %s", want)
 }
 
+// waitCond 轮询直到 cond 成立（10s 上限），用于等待"已挂起"等复合状态。
+func waitCond(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for %s", what)
+}
+
 func TestHappyPath(t *testing.T) {
 	var parseCount, embedCount atomic.Int32
 	st := startStack(t,
@@ -458,11 +471,17 @@ func TestRegistrationSurvivesRestart(t *testing.T) {
 	t.Cleanup(app.Close)
 
 	// 与 main.go 一致的 persist 闭包：registry.Function → store.RegisteredFunction
+	// （cancel_on 序列化为 JSON 字符串，空规则留空）
 	persist := func(st *store.SQLiteStore) func(context.Context, string, []registry.Function) error {
 		return func(ctx context.Context, appURL string, fns []registry.Function) error {
 			rfns := make([]store.RegisteredFunction, 0, len(fns))
 			for _, f := range fns {
-				rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Retries: f.Retries})
+				var cancelOn string
+				if len(f.CancelOn) > 0 {
+					b, _ := json.Marshal(f.CancelOn)
+					cancelOn = string(b)
+				}
+				rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Retries: f.Retries, CancelOn: cancelOn})
 			}
 			return st.ReplaceAppFunctions(ctx, appURL, rfns)
 		}
@@ -527,4 +546,166 @@ func TestRegistrationSurvivesRestart(t *testing.T) {
 	s := &stack{store: st2, eventURL: eventSrv.URL}
 	s.sendEvent(t, `{"name":"doc/uploaded","data":{}}`)
 	waitStatus(t, st2, store.RunCompleted)
+}
+
+// TestWaitForEventResume：step A → WaitForEvent(带 match) 挂起。挂起期间 run 保持
+// Running 且零占用；match 不命中的同名事件不恢复；命中事件到达后 run 恢复完成，
+// WaitForEvent 返回该事件（平台写入 memo 的 {"id","name","data","ts"}）。
+func TestWaitForEventResume(t *testing.T) {
+	var appCalls atomic.Int32
+	var got atomic.Pointer[triggerlink.Event]
+	st := startStack(t,
+		triggerlink.FunctionOpts{ID: "approver", Event: "doc/uploaded"},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			appCalls.Add(1)
+			if _, err := step.Run(ctx, "parse", func(ctx context.Context) (any, error) {
+				return "p", nil
+			}); err != nil {
+				return nil, err
+			}
+			ev, err := step.WaitForEvent(ctx, "wait-approval", step.WaitOpts{
+				Event:   "doc/approved",
+				Match:   "data.doc_id == event.data.doc_id",
+				Timeout: 5 * time.Second,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if ev == nil {
+				return "timeout", nil
+			}
+			got.Store(ev)
+			return "approved", nil
+		}, nil)
+
+	st.sendEvent(t, `{"name":"doc/uploaded","data":{"doc_id":"d1"}}`)
+
+	// 挂起：step A 与 waitForEvent 各一跳回调（appCalls=2），run 停在 Running 未完成
+	waitCond(t, "run suspended", func() bool {
+		n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunRunning)
+		return appCalls.Load() == 2 && n == 1
+	})
+	time.Sleep(200 * time.Millisecond)
+	if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n != 0 {
+		t.Fatal("run completed while suspended")
+	}
+	if appCalls.Load() != 2 {
+		t.Fatalf("app called %d times while suspended", appCalls.Load())
+	}
+
+	// match 不命中的同名事件：不恢复
+	st.sendEvent(t, `{"name":"doc/approved","data":{"doc_id":"other"}}`)
+	time.Sleep(300 * time.Millisecond)
+	if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n != 0 {
+		t.Fatal("run resumed by non-matching event")
+	}
+	if appCalls.Load() != 2 {
+		t.Fatalf("app called %d times after non-matching event", appCalls.Load())
+	}
+
+	// match 命中：恢复并完成，WaitForEvent 返回到达的事件
+	st.sendEvent(t, `{"id":"approve-1","name":"doc/approved","data":{"doc_id":"d1","by":"alice"}}`)
+	waitStatus(t, st.store, store.RunCompleted)
+
+	ev := got.Load()
+	if ev == nil {
+		t.Fatal("WaitForEvent did not return the matched event")
+	}
+	if ev.ID != "approve-1" || ev.Name != "doc/approved" {
+		t.Fatalf("event: %+v", ev)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(ev.Data, &data); err != nil {
+		t.Fatalf("unmarshal event data: %v", err)
+	}
+	if data["doc_id"] != "d1" || data["by"] != "alice" {
+		t.Fatalf("event data: %v", data)
+	}
+	if appCalls.Load() != 3 {
+		t.Fatalf("appCalls=%d, want 3 (step A + wait + resume)", appCalls.Load())
+	}
+}
+
+// TestWaitForEventTimeout：WaitForEvent 设几百毫秒超时，无事件到达 →
+// 平台以 output=null 完成 memo 并恢复 run，SDK 返回 nil 走超时分支。
+func TestWaitForEventTimeout(t *testing.T) {
+	var appCalls atomic.Int32
+	var timedOut atomic.Bool
+	st := startStack(t,
+		triggerlink.FunctionOpts{ID: "waiter", Event: "doc/uploaded"},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			appCalls.Add(1)
+			ev, err := step.WaitForEvent(ctx, "wait", step.WaitOpts{
+				Event:   "doc/approved",
+				Timeout: 300 * time.Millisecond,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if ev == nil {
+				timedOut.Store(true)
+				return "timeout", nil
+			}
+			return "resumed", nil
+		}, nil)
+
+	st.sendEvent(t, `{"name":"doc/uploaded","data":{"doc_id":"d1"}}`)
+	waitStatus(t, st.store, store.RunCompleted)
+
+	if !timedOut.Load() {
+		t.Fatal("WaitForEvent did not take the timeout branch")
+	}
+	if appCalls.Load() != 2 {
+		t.Fatalf("appCalls=%d, want 2 (initial + timeout resume)", appCalls.Load())
+	}
+}
+
+// TestCancelOn：函数配置 CancelOn（带 match），挂起等待期间匹配事件到达 →
+// 在途 run 被取消（Cancelled）；此后等待的事件到达也不再恢复（应用侧不再被回调）。
+func TestCancelOn(t *testing.T) {
+	var appCalls atomic.Int32
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID:    "cancellable",
+			Event: "doc/uploaded",
+			CancelOn: []triggerlink.CancelOn{
+				{Event: "doc/cancelled", Match: "data.doc_id == event.data.doc_id"},
+			},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			appCalls.Add(1)
+			if _, err := step.Run(ctx, "a", func(ctx context.Context) (any, error) {
+				return "a", nil
+			}); err != nil {
+				return nil, err
+			}
+			if _, err := step.WaitForEvent(ctx, "wait", step.WaitOpts{
+				Event:   "doc/approved",
+				Timeout: time.Hour,
+			}); err != nil {
+				return nil, err
+			}
+			return "done", nil
+		}, nil)
+
+	st.sendEvent(t, `{"name":"doc/uploaded","data":{"doc_id":"d1"}}`)
+	// 挂起：step A 与 waitForEvent 各一跳回调（appCalls=2），run 停在 Running
+	waitCond(t, "run suspended", func() bool {
+		n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunRunning)
+		return appCalls.Load() == 2 && n == 1
+	})
+
+	// cancelOn match 命中 → run 终态 Cancelled
+	st.sendEvent(t, `{"name":"doc/cancelled","data":{"doc_id":"d1"}}`)
+	waitStatus(t, st.store, store.RunCancelled)
+
+	// 之后等待的事件到达：终态 run 不恢复，应用侧无新回调
+	st.sendEvent(t, `{"name":"doc/approved","data":{"doc_id":"d1"}}`)
+	time.Sleep(300 * time.Millisecond)
+	if appCalls.Load() != 2 {
+		t.Fatalf("app called %d times after cancel", appCalls.Load())
+	}
+	if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n != 0 {
+		t.Fatal("cancelled run resumed")
+	}
 }

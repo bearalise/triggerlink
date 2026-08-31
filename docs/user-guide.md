@@ -246,6 +246,45 @@ _, err = step.Run(ctx, "send-reminder", func(ctx context.Context) (any, error) {
 
 `step.SendEvent(ctx, "notify", step.Event{Name: "user/greeted", Data: ...})` reliably fans out events from within a function: the platform persists them before routing (crash-safe), and functions subscribed to the event are triggered right away. The memo semantics match `step.Run`: when the run is re-entered after recovery, it returns the IDs of the already-sent events (`[]string`) without sending again. If the event `ID` is omitted, the platform derives it deterministically from `(run_id, step_hash, ordinal)` — crash retries are naturally idempotent; supplying your own business-unique key is even stronger. The TS SDK equivalent is `step.sendEvent(id, events)` (single or array), returning `Promise<string[]>`.
 
+### 5.3.3 step.WaitForEvent (Wait for Another Event)
+
+`step.WaitForEvent` suspends the run until a matching event arrives or a timeout elapses — the classic "wait for the payment callback after creating the order" pattern. Like `step.Sleep`, suspension holds no connection or compute; unlike `Sleep`, resumption is driven by event routing (or the timeout scan), not the queue. The memo semantics match the other primitives: on re-entry the matched event is injected directly instead of waiting again.
+
+```go
+ev, err := step.WaitForEvent(ctx, "wait-payment", step.WaitOpts{
+    Event:   "order/payed",                              // required: the event name to wait for
+    Match:   "data.order_id == event.data.order_id",     // optional: fine-grained match (expr-lang)
+    Timeout: 7 * 24 * time.Hour,                         // optional: nil return on timeout
+})
+if err != nil {
+    return nil, err
+}
+if ev == nil {
+    return map[string]any{"status": "payment timeout"}, nil // timeout branch
+}
+// ev is *triggerlink.Event {ID, Name, Data, TS} — the matched event
+```
+
+In the `Match` expression, `data` is the arriving event's `data` and `event` is this run's triggering event `{name, data}` — the example above means "only the `order/payed` event whose `order_id` equals this order's". The TS SDK equivalent is `step.waitForEvent(id, { event, match?, timeout? })`, returning `Promise<TriggerLinkEvent | null>`; `timeout` accepts a Go duration string (`"168h"`) or a millisecond number (`1500` → `"1.5s"`).
+
+### 5.3.4 CancelOn (Cancelling In-Flight Runs by Event)
+
+`CancelOn` in `FunctionOpts` declares cancellation rules that ship with the manifest: when the named event arrives (and the optional `match` expression hits), the platform cancels that function's in-flight (Queued/Running) runs — e.g. cancel the onboarding flow when the account is deleted:
+
+```go
+fn := triggerlink.CreateFunction(
+    triggerlink.FunctionOpts{
+        ID: "onboarding", Event: "user/signup",
+        CancelOn: []triggerlink.CancelOn{
+            {Event: "user/deleted", Match: "data.user_id == event.data.user_id"},
+        },
+    },
+    handler,
+)
+```
+
+The `Match` environment is the same as `step.WaitForEvent`: `data` = the arriving event's `data`, `event` = the run's triggering event `{name, data}`; an empty `Match` cancels on arrival. The TS SDK equivalent is `cancelOn: [{ event: "user/deleted", match: "..." }]` in `createFunction` options. Note the rules are evaluated against runs of the function that carries them — a run already in a terminal state is unaffected.
+
 ### 5.4 Error Handling Semantics
 
 - A step returning an error → the platform records a failure memo and retries with backoff (starting at 1s, exponential, capped at 30s); after **4 total attempts by default** the run is marked Failed.
@@ -432,6 +471,5 @@ On "self-registration" in step 1: it is purely a local-development convenience (
 
 The following capabilities are **not available** in the current version:
 
-- `step.waitForEvent`
 - Cron-based scheduled triggers (use an external cron emitting events instead)
 - Postgres backend, multi-replica platform (currently single-process + SQLite)

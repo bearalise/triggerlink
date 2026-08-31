@@ -46,6 +46,9 @@ export function serve(opts: ServeOptions) {
         id: f.opts.id,
         event: f.opts.event,
         retries: f.opts.retries,
+        ...(f.opts.cancelOn?.length
+          ? { cancel_on: f.opts.cancelOn.map((c) => ({ event: c.event, match: c.match })) }
+          : {}),
       })),
     });
   }

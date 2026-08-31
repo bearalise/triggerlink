@@ -348,3 +348,107 @@ func TestCancelledRunNotDispatched(t *testing.T) {
 		t.Fatalf("status=%s, want Cancelled", r.Status)
 	}
 }
+
+// TestWaitForEventSuspends：WaitForEvent opcode → memo waiting + wait 落库 + 不入队（挂起零占用）。
+func TestWaitForEventSuspends(t *testing.T) {
+	var calls atomic.Int32
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		json.NewEncoder(w).Encode(map[string]any{
+			"op": "WaitForEvent", "id": "h_wait", "step_id": "wait-payed",
+			"event": "order/payed", "match": `data.order_id == event.data.order_id`, "timeout": "1h"})
+	})
+	e := newEnv(t, app)
+	e.seedRun(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.exec.Run(ctx)
+
+	// run 保持 Running（Waiting 是 Running 子状态），且不会产生后续回调
+	time.Sleep(300 * time.Millisecond)
+	r, _ := e.store.GetRun(context.Background(), "run_1")
+	if r.Status != store.RunRunning {
+		t.Fatalf("status=%s, want Running", r.Status)
+	}
+	if int(calls.Load()) != 1 {
+		t.Fatalf("calls=%d, want 1（挂起期间不得再回调）", calls.Load())
+	}
+	steps, _ := e.store.StepResults(context.Background(), "run_1")
+	memo := steps["h_wait"]
+	if memo.Status != store.StepWaiting || memo.Op != "WaitForEvent" {
+		t.Fatalf("memo: %+v", memo)
+	}
+	waits, err := e.store.WaitingWaitsForEvent(context.Background(), "order/payed")
+	if err != nil || len(waits) != 1 {
+		t.Fatalf("waits=%+v err=%v", waits, err)
+	}
+	w0 := waits[0]
+	if w0.RunID != "run_1" || w0.StepHash != "h_wait" || w0.MatchExpr == "" || w0.ExpiresAt == nil {
+		t.Fatalf("wait: %+v", w0)
+	}
+	// 挂起后队列里不得有该 run 的残留项
+	items, _ := e.store.LeaseBatch(context.Background(), time.Now().Add(2*time.Hour), time.Minute, 8)
+	for _, it := range items {
+		if it.RunID == "run_1" {
+			t.Fatalf("suspended run still enqueued: %+v", it)
+		}
+	}
+}
+
+// TestWaitForEventIdempotent：同一 opcode 重放（崩溃重试）不产生第二条 wait。
+func TestWaitForEventIdempotent(t *testing.T) {
+	var calls atomic.Int32
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		json.NewEncoder(w).Encode(map[string]any{
+			"op": "WaitForEvent", "id": "h_wait", "step_id": "wait-payed", "event": "order/payed"})
+	})
+	e := newEnv(t, app)
+	e.seedRun(t)
+	// 模拟崩溃窗口：第一次 dispatch 后队列项意外重置回 pending（再造一个等价项）
+	if err := e.store.Enqueue(context.Background(), store.QueueItem{ID: "qi_2", FunctionID: "fn",
+		RunID: "run_1", Score: time.Now().UnixNano(), At: time.Now(), Status: store.QueuePending}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.exec.Run(ctx)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		waits, _ := e.store.WaitingWaitsForEvent(context.Background(), "order/payed")
+		if calls.Load() >= 2 && len(waits) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if int(calls.Load()) != 2 {
+		t.Fatalf("calls=%d, want 2", calls.Load())
+	}
+	waits, err := e.store.WaitingWaitsForEvent(context.Background(), "order/payed")
+	if err != nil || len(waits) != 1 {
+		t.Fatalf("waits=%+v err=%v, want exactly 1", waits, err)
+	}
+	if waits[0].ExpiresAt != nil { // 无 timeout：expires_at 为 NULL
+		t.Fatalf("expires_at=%v, want nil", waits[0].ExpiresAt)
+	}
+}
+
+// TestWaitForEventMissingEventRetried：event 缺失按失败尝试处理（退避重试直至终结）。
+func TestWaitForEventMissingEventRetried(t *testing.T) {
+	var calls atomic.Int32
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		json.NewEncoder(w).Encode(map[string]any{"op": "WaitForEvent", "id": "h1", "step_id": "wait"})
+	})
+	e := newEnv(t, app)
+	e.seedRun(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.exec.Run(ctx)
+
+	e.waitStatus(t, store.RunFailed)
+	if int(calls.Load()) != 3 { // MaxRetries=3
+		t.Fatalf("calls=%d", calls.Load())
+	}
+}

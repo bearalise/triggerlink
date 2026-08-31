@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	triggerlink "github.com/bearalise/triggerlink/sdk"
 	"github.com/bearalise/triggerlink/sdk/internal/execx"
 )
 
@@ -87,4 +88,41 @@ func SendEvent(ctx context.Context, id string, events ...Event) ([]string, error
 		return nil, fmt.Errorf("step.SendEvent %q: no events", id)
 	}
 	panic(&execx.Opcode{Op: "SendEvent", ID: h, StepID: id, Events: events})
+}
+
+// WaitOpts 是 WaitForEvent 的配置。
+type WaitOpts struct {
+	Event   string        // 等待的事件名（必填）
+	Match   string        // 可选 expr 表达式；求值环境：data=到达事件 data，event=本 run 触发事件 {name,data}
+	Timeout time.Duration // 可选超时；超时后 step 以 null output 完成，WaitForEvent 返回 nil
+}
+
+// WaitForEvent 挂起当前 run 直至匹配事件到达或超时（PRD 8.2 情况4 / FR-2.6）：
+// 事件命中 → 返回该事件；超时 → 返回 nil（超时分支）。
+// 与 Sleep 同为挂起原语（恢复重入时 memo 命中直接返回，不会重复挂起），但唤醒不由队列
+// 驱动——平台在事件路由命中或超时扫描时补写 completed memo 并回调恢复，挂起期间零占用。
+func WaitForEvent(ctx context.Context, id string, opts WaitOpts) (*triggerlink.Event, error) {
+	ec := execx.From(ctx)
+	if ec == nil {
+		panic("step.WaitForEvent: no triggerlink execution context (called outside a TriggerLink function?)")
+	}
+	h := ec.NextHash(id)
+	if st, ok := ec.Steps[h]; ok && st.Status == "completed" {
+		if len(st.Output) == 0 || string(st.Output) == "null" {
+			return nil, nil // 超时：平台以 output=JSON null 完成
+		}
+		var ev triggerlink.Event
+		if err := json.Unmarshal(st.Output, &ev); err != nil {
+			return nil, fmt.Errorf("step.WaitForEvent %q: unmarshal memo: %w", id, err)
+		}
+		return &ev, nil
+	}
+	if opts.Event == "" {
+		return nil, fmt.Errorf("step.WaitForEvent %q: event name required", id)
+	}
+	op := &execx.Opcode{Op: "WaitForEvent", ID: h, StepID: id, Event: opts.Event, Match: opts.Match}
+	if opts.Timeout > 0 {
+		op.Timeout = opts.Timeout.String()
+	}
+	panic(op)
 }

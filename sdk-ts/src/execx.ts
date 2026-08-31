@@ -16,13 +16,16 @@ export interface OpError {
 
 /** 应用 → 平台的执行指令（serve 序列化为响应）。 */
 export interface Opcode {
-  op: "StepComplete" | "StepError" | "RunComplete" | "RunError" | "Sleep" | "SendEvent";
+  op: "StepComplete" | "StepError" | "RunComplete" | "RunError" | "Sleep" | "SendEvent" | "WaitForEvent";
   id?: string; // step_hash
   step_id?: string;
   output?: unknown;
   error?: OpError;
   until?: string; // Sleep：唤醒时刻（RFC3339/ISO）
   events?: OutgoingEvent[]; // SendEvent：待扇出事件
+  event?: string; // WaitForEvent：等待的事件名（必填）
+  match?: string; // WaitForEvent：可选 match 表达式（expr-lang）
+  timeout?: string; // WaitForEvent：可选超时（Go duration，如 "168h"）
 }
 
 /** step.sendEvent 待扇出的事件（id/ts 缺省由平台补全，id 缺省为确定性派生）。 */

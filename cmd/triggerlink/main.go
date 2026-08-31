@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
@@ -82,7 +83,12 @@ func main() {
 	persist := func(ctx context.Context, appURL string, fns []registry.Function) error {
 		rfns := make([]store.RegisteredFunction, 0, len(fns))
 		for _, f := range fns {
-			rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Retries: f.Retries})
+			var cancelOn string
+			if len(f.CancelOn) > 0 {
+				b, _ := json.Marshal(f.CancelOn)
+				cancelOn = string(b)
+			}
+			rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Retries: f.Retries, CancelOn: cancelOn})
 		}
 		return st.ReplaceAppFunctions(ctx, appURL, rfns)
 	}
@@ -91,8 +97,14 @@ func main() {
 	} else {
 		byApp := map[string][]registry.Function{}
 		for _, rf := range rfns {
+			var cancelOn []registry.CancelRule
+			if rf.CancelOn != "" {
+				if err := json.Unmarshal([]byte(rf.CancelOn), &cancelOn); err != nil {
+					log.Printf("warn: decode cancel_on of function %s: %v", rf.ID, err)
+				}
+			}
 			byApp[rf.AppURL] = append(byApp[rf.AppURL],
-				registry.Function{ID: rf.ID, Event: rf.Event, Retries: rf.Retries, AppURL: rf.AppURL})
+				registry.Function{ID: rf.ID, Event: rf.Event, Retries: rf.Retries, CancelOn: cancelOn, AppURL: rf.AppURL})
 		}
 		for appURL, fns := range byApp {
 			reg.Sync(appURL, fns)
