@@ -1,0 +1,27 @@
+# TriggerLink 最小 compose 示例：平台单容器 + SQLite 卷。
+# 生产使用请改用 .env 注入密钥并置于 TLS 反代之后（见 docs/deployment.md）。
+services:
+  triggerlink:
+    build: .
+    # 或使用发布镜像：image: ghcr.io/bearalise/triggerlink:latest
+    ports:
+      - "8288:8288"
+    volumes:
+      - triggerlink-data:/data
+    environment:
+      # 注意：密钥请通过环境变量传入，勿写死在 compose 文件里提交
+      TRIGGERLINK_EVENT_KEY: ${TRIGGERLINK_EVENT_KEY:?set TRIGGERLINK_EVENT_KEY}
+      TRIGGERLINK_SIGNING_KEY: ${TRIGGERLINK_SIGNING_KEY:?set TRIGGERLINK_SIGNING_KEY}
+      TRIGGERLINK_DASHBOARD_AUTH: ${TRIGGERLINK_DASHBOARD_AUTH:-}
+    # ENTRYPOINT 已含 start -db /data/triggerlink.db，这里补齐密钥与 dashboard 凭据
+    command:
+      - "-event-key"
+      - "${TRIGGERLINK_EVENT_KEY}"
+      - "-signing-key"
+      - "${TRIGGERLINK_SIGNING_KEY}"
+      - "-dashboard-auth"
+      - "${TRIGGERLINK_DASHBOARD_AUTH:-admin:admin}"
+    restart: unless-stopped
+
+volumes:
+  triggerlink-data:

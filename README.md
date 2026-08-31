@@ -4,6 +4,10 @@
 
 An open-source, event-driven durable execution platform (M0 prototype). Write crash-recoverable, step-level-retryable async workflows as plain Go functions.
 
+## Install
+
+Prebuilt binaries (linux/darwin/windows) are on [GitHub Releases](https://github.com/bearalise/triggerlink/releases); a multi-arch image is at `ghcr.io/bearalise/triggerlink` (see `docker-compose.yml` for a minimal setup). Or build from source: `go build ./cmd/triggerlink`.
+
 ## Quickstart
 
 ```bash
@@ -58,7 +62,7 @@ Constraints: put side effects inside `step.Run`; the step call sequence must be 
 
 ## Out of scope for M0
 
-waitForEvent, Cron, and a Postgres backend are planned for later milestones.
+Cron triggers and a Postgres backend are planned for later milestones.
 
 ## Development
 

@@ -1,0 +1,20 @@
+.git
+.github
+.worktrees
+
+**/node_modules
+sdk-ts/dist
+web/dist
+
+# 本地运行产物
+triggerlink
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+
+# 文档与设计稿不进镜像
+docs
+examples
+e2e

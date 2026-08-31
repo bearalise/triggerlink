@@ -31,11 +31,24 @@ M0 has only three kinds of deployment units (processes):
 | Next.js/TS apps | Node.js ≥ 18 (22 recommended), and must use the Node.js runtime (not Edge) |
 | Operating system | Accurate clock (NTP sync) — signature verification allows a ±5 minute timestamp tolerance; excessive clock drift causes callback 401s |
 
-## 3. Get the Source and Build
+## 3. Get the Binary
+
+**Option A: prebuilt binary (recommended).** Download the archive for your platform from [GitHub Releases](https://github.com/bearalise/triggerlink/releases) (linux/darwin/windows × amd64/arm64, with `checksums.txt`), or run the Docker image:
 
 ```bash
-git clone https://github.com/Richardo1o1/TriggerLink.git
-cd TriggerLink
+docker run -d --name triggerlink \
+  -p 8288:8288 -v triggerlink-data:/data \
+  ghcr.io/bearalise/triggerlink:latest \
+  -event-key <EVENT_KEY> -signing-key <SIGNING_KEY> \
+  -dashboard-auth admin:<password>
+# A docker-compose.yml example is included in the repository root.
+```
+
+**Option B: build from source.**
+
+```bash
+git clone https://github.com/bearalise/triggerlink.git
+cd triggerlink
 
 # Platform binary (output at ./triggerlink)
 go build ./cmd/triggerlink

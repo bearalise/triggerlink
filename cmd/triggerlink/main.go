@@ -25,6 +25,9 @@ import (
 	"github.com/bearalise/triggerlink/internal/store"
 )
 
+// version 由 goreleaser 通过 -ldflags "-X main.version=..." 注入；本地构建为 dev。
+var version = "dev"
+
 type stringSlice []string
 
 func (s *stringSlice) String() string { return "" }
@@ -38,6 +41,10 @@ func main() {
 	// 无子命令时按 start 处理（兼容旧的 flag 直传用法）。
 	cmd := "start"
 	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "version" {
+		log.Printf("triggerlink %s", version)
+		return
+	}
 	if len(args) > 0 && (args[0] == "start" || args[0] == "dev") {
 		cmd, args = args[0], args[1:]
 	}
@@ -167,7 +174,7 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("triggerlink [%s] listening on %s (db=%s, apps=%d)", cmd, addr, dbPath, len(apps))
+	log.Printf("triggerlink %s [%s] listening on %s (db=%s, apps=%d)", version, cmd, addr, dbPath, len(apps))
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}

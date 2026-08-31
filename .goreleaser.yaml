@@ -1,0 +1,36 @@
+# goreleaser 配置：打 tag（v*）后由 .github/workflows/release.yml 触发。
+# 产出：多平台二进制压缩包 + checksums + GitHub Release。Docker 镜像由同一 workflow 的
+# 独立 job 构建（buildx 多架构，推 ghcr.io）。
+version: 2
+
+project_name: triggerlink
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: triggerlink
+    main: ./cmd/triggerlink
+    binary: triggerlink
+    env:
+      - CGO_ENABLED=0 # modernc.org/sqlite 为纯 Go 实现，无 CGO 依赖
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: github-native
