@@ -92,7 +92,7 @@ The typical relationship: **the producer sends an event → the platform persist
 ## 4. Deploying the Platform
 
 ```bash
-go run ./cmd/triggerlink \
+go run ./cmd/triggerlink start \
   -addr :8288 \
   -db triggerlink.db \
   -event-key <producer auth key> \
@@ -101,14 +101,16 @@ go run ./cmd/triggerlink \
   -app http://app2-host:9090/api/triggerlink   # repeatable, to connect multiple apps
 ```
 
+Subcommands: `start` runs the production server (both keys required); `dev` runs the same kernel for local development and auto-generates any missing `-event-key` / `-signing-key` (printed to the startup logs). Invoking the binary with flags only (no subcommand) behaves like `start`.
+
 Flag reference:
 
 | Flag | Default | Description |
 |---|---|---|
 | `-addr` | `:8288` | Event API listen address |
 | `-db` | `triggerlink.db` | SQLite file path (WAL mode; a single file is enough) |
-| `-event-key` | (required) | Bearer key for producers calling `POST /v1/events` |
-| `-signing-key` | (required) | HMAC signing key used when the platform calls back applications; **must match the application's `SigningKey`** |
+| `-event-key` | (required for `start`) | Bearer key for producers calling `POST /v1/events` |
+| `-signing-key` | (required for `start`) | HMAC signing key used when the platform calls back applications; **must match the application's `SigningKey`** |
 | `-app` | none | Application serve URL; repeat to connect multiple applications |
 
 Notes:

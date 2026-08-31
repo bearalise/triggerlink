@@ -29,7 +29,7 @@ type Executor struct {
 	Client         *http.Client
 	SigningKey     string
 	Stream         chan<- store.Event // step.sendEvent 扇出用；nil 时仅落库不入流（测试用）
-	MaxRetries     int                // 默认 4；M0：回调尝试总数上限
+	MaxRetries     int                // 默认 4；M0：回调尝试总数上限；函数注册了 Retries 时被其覆盖
 	Concurrency    int                // 每函数并发 run 上限，默认 100
 	BatchSize      int                // 每轮租赁上限，默认 16
 	PollInterval   time.Duration      // 默认 100ms
@@ -170,6 +170,11 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		return
 	}
+	// 函数级重试覆盖（FR-4.2）：未配置用全局 MaxRetries。M0 语义：尝试总数上限。
+	maxAttempts := fn.Retries
+	if maxAttempts <= 0 {
+		maxAttempts = e.MaxRetries
+	}
 	attempt, err := e.Store.IncrementRunAttempt(ctx, run.ID)
 	if err != nil {
 		log.Printf("executor: attempt %s: %v", run.ID, err)
@@ -191,13 +196,13 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	// sleep 唤醒转换：到达唤醒时刻的 dispatch 把 sleeping memo 置为 completed，
 	// 使应用重入时 sleep step 命中 memo 直接返回（幂等；顺序执行下至多一个 sleeping step）
 	if err := e.Store.CompleteSleepingSteps(ctx, run.ID); err != nil {
-		e.retryOrFail(ctx, item, run, attempt, "complete sleeping steps: "+err.Error())
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "complete sleeping steps: "+err.Error())
 		return
 	}
 
 	steps, err := e.Store.StepResults(ctx, run.ID)
 	if err != nil {
-		e.retryOrFail(ctx, item, run, attempt, "load steps: "+err.Error())
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "load steps: "+err.Error())
 		return
 	}
 	var req callbackRequest
@@ -215,7 +220,7 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	body, _ := json.Marshal(req)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fn.AppURL, bytes.NewReader(body))
 	if err != nil {
-		e.retryOrFail(ctx, item, run, attempt, err.Error())
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, err.Error())
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -223,18 +228,18 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 
 	resp, err := e.Client.Do(httpReq)
 	if err != nil {
-		e.retryOrFail(ctx, item, run, attempt, "callback: "+err.Error())
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "callback: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if resp.StatusCode != http.StatusOK {
-		e.retryOrFail(ctx, item, run, attempt, fmt.Sprintf("app status %d: %s", resp.StatusCode, truncate(string(respBody), 200)))
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, fmt.Sprintf("app status %d: %s", resp.StatusCode, truncate(string(respBody), 200)))
 		return
 	}
 	var op opcode
 	if err := json.Unmarshal(respBody, &op); err != nil {
-		e.retryOrFail(ctx, item, run, attempt, "decode opcode: "+err.Error())
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "decode opcode: "+err.Error())
 		return
 	}
 
@@ -257,10 +262,10 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.Store.SaveStepResult(ctx, store.StepResult{
 			RunID: run.ID, StepHash: op.ID, StepID: op.StepID, Op: "Run",
 			Status: store.StepFailed, Error: msg, Attempt: attempt})
-		e.retryOrFail(ctx, item, run, attempt, msg)
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, msg)
 	case "Sleep":
 		if op.Until.IsZero() {
-			e.retryOrFail(ctx, item, run, attempt, "sleep opcode missing until")
+			e.retryOrFail(ctx, item, run, attempt, maxAttempts, "sleep opcode missing until")
 			return
 		}
 		// 挂起：写 sleeping memo → 完成当前队列项 → 以 at=until 入队唤醒跳。
@@ -272,15 +277,15 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.enqueueNext(ctx, run, op.Until)
 		log.Printf("executor: run %s sleeping until %s", run.ID, op.Until.Format(time.RFC3339))
 	case "SendEvent":
-		e.handleSendEvent(ctx, item, run, attempt, op)
+		e.handleSendEvent(ctx, item, run, attempt, maxAttempts, op)
 	case "RunComplete":
 		e.Store.CompleteRun(ctx, run.ID, op.Output)
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		log.Printf("executor: run %s completed", run.ID)
 	case "RunError":
-		e.retryOrFail(ctx, item, run, attempt, opcodeErrMsg(op, "run error"))
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, opcodeErrMsg(op, "run error"))
 	default:
-		e.retryOrFail(ctx, item, run, attempt, "unknown opcode: "+op.Op)
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "unknown opcode: "+op.Op)
 	}
 }
 
@@ -288,15 +293,15 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 // 顺序承诺同 eventapi：先 InsertEvent 落库成功 → 再推入 stream → 写 memo → 推进下一跳。
 // 缺省事件 ID 按 (run_id, step_hash, 序号) 确定性派生：崩溃窗口内重试同一 step 时
 // 重发同 ID 事件，由 InsertEvent 幂等去重，不会重复扇出。
-func (e *Executor) handleSendEvent(ctx context.Context, item store.QueueItem, run store.Run, attempt int, op opcode) {
+func (e *Executor) handleSendEvent(ctx context.Context, item store.QueueItem, run store.Run, attempt, maxAttempts int, op opcode) {
 	if len(op.Events) == 0 {
-		e.retryOrFail(ctx, item, run, attempt, "send_event: no events")
+		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "send_event: no events")
 		return
 	}
 	idsOut := make([]string, 0, len(op.Events))
 	for i, in := range op.Events {
 		if in.Name == "" {
-			e.retryOrFail(ctx, item, run, attempt, "send_event: event name required")
+			e.retryOrFail(ctx, item, run, attempt, maxAttempts, "send_event: event name required")
 			return
 		}
 		if in.Data == nil {
@@ -311,7 +316,7 @@ func (e *Executor) handleSendEvent(ctx context.Context, item store.QueueItem, ru
 		evt := store.Event{ID: in.ID, Name: in.Name, Data: in.Data, TS: in.TS}
 		inserted, err := e.Store.InsertEvent(ctx, evt)
 		if err != nil {
-			e.retryOrFail(ctx, item, run, attempt, "send_event: "+err.Error())
+			e.retryOrFail(ctx, item, run, attempt, maxAttempts, "send_event: "+err.Error())
 			return
 		}
 		if inserted && e.Stream != nil {
@@ -334,7 +339,8 @@ func derivedEventID(runID, stepHash string, i int) string {
 	return "evt_" + hex.EncodeToString(sum[:8])
 }
 
-func (e *Executor) retryOrFail(ctx context.Context, item store.QueueItem, run store.Run, attempt int, msg string) {	if attempt >= e.MaxRetries {
+func (e *Executor) retryOrFail(ctx context.Context, item store.QueueItem, run store.Run, attempt, maxAttempts int, msg string) {
+	if attempt >= maxAttempts {
 		e.Store.FailRun(ctx, run.ID, msg)
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		log.Printf("executor: run %s failed after %d attempts: %s", run.ID, attempt, msg)

@@ -65,6 +65,36 @@ func TestRoutesStreamEvent(t *testing.T) {
 	waitRuns(t, st, 1)
 }
 
+// TestDelayedEventNotLeasedBeforeTS：ts 为未来时间的延迟事件，到点前队列项不可租赁（FR-1.6）。
+func TestDelayedEventNotLeasedBeforeTS(t *testing.T) {
+	r, st, stream := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx)
+
+	future := time.Now().Add(time.Hour)
+	stream <- store.Event{ID: "evt_delay", Name: "doc/uploaded",
+		Data: json.RawMessage(`{}`), TS: future}
+	waitRuns(t, st, 1)
+
+	// 到点前：LeaseBatch 取不到
+	items, err := st.LeaseBatch(ctx, time.Now(), time.Minute, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("leased %d items before ts, want 0", len(items))
+	}
+	// 到点后：可租赁
+	items, err = st.LeaseBatch(ctx, future, time.Minute, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("leased %d items at ts, want 1", len(items))
+	}
+}
+
 func TestStartupReconciliation(t *testing.T) {
 	r, st, _ := setup(t)
 	// 直接落库、不走 stream —— 模拟"已接收但崩溃前未路由"

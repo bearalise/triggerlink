@@ -1,4 +1,5 @@
 // triggerlink M0：单进程服务器（Event API + Runner + Queue + Executor + SQLite）。
+// 子命令：start（生产，密钥必填）、dev（本地开发，密钥缺省自动生成）；无子命令按 start 处理。
 package main
 
 import (
@@ -32,18 +33,38 @@ func (s *stringSlice) Set(v string) error {
 }
 
 func main() {
+	// 子命令：triggerlink start（生产，密钥必填）/ triggerlink dev（本地开发，密钥缺省自动生成）。
+	// 无子命令时按 start 处理（兼容旧的 flag 直传用法）。
+	cmd := "start"
+	args := os.Args[1:]
+	if len(args) > 0 && (args[0] == "start" || args[0] == "dev") {
+		cmd, args = args[0], args[1:]
+	}
+
 	var addr, dbPath, eventKey, signingKey string
 	var apps stringSlice
 	var dashAuth string
-	flag.StringVar(&addr, "addr", ":8288", "Event API 监听地址")
-	flag.StringVar(&dbPath, "db", "triggerlink.db", "SQLite 数据库路径")
-	flag.StringVar(&eventKey, "event-key", "", "Event API 鉴权 key（必填）")
-	flag.StringVar(&signingKey, "signing-key", "", "平台→应用回调签名密钥（必填）")
-	flag.StringVar(&dashAuth, "dashboard-auth", "", "Dashboard basic auth 凭据 user:password（默认读 TRIGGERLINK_DASHBOARD_AUTH；都为空则生成随机密码打日志）")
-	flag.Var(&apps, "app", "应用 serve URL（可重复，如 http://localhost:8080/api/triggerlink）")
-	flag.Parse()
+	fs := flag.NewFlagSet("triggerlink "+cmd, flag.ExitOnError)
+	fs.StringVar(&addr, "addr", ":8288", "Event API 监听地址")
+	fs.StringVar(&dbPath, "db", "triggerlink.db", "SQLite 数据库路径")
+	fs.StringVar(&eventKey, "event-key", "", "Event API 鉴权 key（start 必填，dev 缺省自动生成）")
+	fs.StringVar(&signingKey, "signing-key", "", "平台→应用回调签名密钥（start 必填，dev 缺省自动生成）")
+	fs.StringVar(&dashAuth, "dashboard-auth", "", "Dashboard basic auth 凭据 user:password（默认读 TRIGGERLINK_DASHBOARD_AUTH；都为空则生成随机密码打日志）")
+	fs.Var(&apps, "app", "应用 serve URL（可重复，如 http://localhost:8080/api/triggerlink）")
+	fs.Parse(args)
+
+	if cmd == "dev" {
+		if eventKey == "" {
+			eventKey = ids.NewID("evtkey")
+			log.Printf("dev: 自动生成 event-key=%s", eventKey)
+		}
+		if signingKey == "" {
+			signingKey = ids.NewID("signkey")
+			log.Printf("dev: 自动生成 signing-key=%s", signingKey)
+		}
+	}
 	if eventKey == "" || signingKey == "" {
-		log.Fatal("必须提供 -event-key 与 -signing-key")
+		log.Fatal("必须提供 -event-key 与 -signing-key（或使用 triggerlink dev 自动生成）")
 	}
 
 	st, err := store.Open(dbPath)
@@ -134,7 +155,7 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("triggerlink listening on %s (db=%s, apps=%d)", addr, dbPath, len(apps))
+	log.Printf("triggerlink [%s] listening on %s (db=%s, apps=%d)", cmd, addr, dbPath, len(apps))
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}

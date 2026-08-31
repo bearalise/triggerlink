@@ -66,7 +66,7 @@ openssl rand -hex 32   # use as SIGNING_KEY: HMAC signing key for platform ↔ a
 TRIGGERLINK_SIGNING_KEY=<SIGNING_KEY> ./your-app &      # listens on :8080
 
 # 2. Start the platform
-./triggerlink \
+./triggerlink start \
   -addr :8288 \
   -db /var/lib/triggerlink/triggerlink.db \
   -event-key <EVENT_KEY> \
@@ -104,7 +104,7 @@ After=network.target
 Type=simple
 EnvironmentFile=/etc/triggerlink/env
 WorkingDirectory=/var/lib/triggerlink
-ExecStart=/usr/local/bin/triggerlink \
+ExecStart=/usr/local/bin/triggerlink start \
   -addr :8288 \
   -db /var/lib/triggerlink/triggerlink.db \
   -event-key ${TRIGGERLINK_EVENT_KEY} \

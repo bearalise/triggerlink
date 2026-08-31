@@ -270,6 +270,30 @@ func TestSendEventFansOut(t *testing.T) {
 	}
 }
 
+// TestFunctionRetriesOverride：函数注册的 Retries 覆盖全局 MaxRetries（FR-4.2）。
+func TestFunctionRetriesOverride(t *testing.T) {
+	var calls atomic.Int32
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		json.NewEncoder(w).Encode(map[string]any{
+			"op": "StepError", "id": "h1", "step_id": "embed",
+			"error": map[string]any{"message": "boom", "retryable": true}})
+	})
+	e := newEnv(t, app)
+	f, _ := e.reg.Lookup("fn")
+	f.Retries = 1
+	e.reg.Register(f)
+	e.seedRun(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.exec.Run(ctx)
+
+	e.waitStatus(t, store.RunFailed)
+	if int(calls.Load()) != 1 { // fn.Retries=1：1 次尝试即终结，不走全局 MaxRetries=3
+		t.Fatalf("calls=%d, want 1", calls.Load())
+	}
+}
+
 func TestStepErrorThenRecover(t *testing.T) {
 	var calls atomic.Int32
 	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

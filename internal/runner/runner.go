@@ -61,12 +61,17 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 		}); err != nil {
 			return err
 		}
+		// 延迟事件（FR-1.6）：ts 为未来时间时，到点前不出队触发。
+		at := time.Now()
+		if e.TS.After(at) {
+			at = e.TS
+		}
 		if err := r.Store.Enqueue(ctx, store.QueueItem{
 			ID:         ids.NewID("qi"),
 			FunctionID: f.ID,
 			RunID:      runID,
 			Score:      time.Now().UnixNano(),
-			At:         time.Now(),
+			At:         at,
 			Status:     store.QueuePending,
 		}); err != nil {
 			return err
