@@ -2,21 +2,70 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
-func openTemp(t *testing.T) *SQLiteStore {
+// openTemp 给单个测试一个干净的库。后端由环境变量选择：
+//
+//	go test ./internal/store/                                   # SQLite（默认）
+//	TEST_POSTGRES_URI=postgres://... go test ./internal/store/   # 同一套断言跑 Postgres
+//
+// 两个后端共用同一套查询代码（见 dialect.go），所以矩阵跑的是同样的断言、
+// 同样的语义——两边行为分叉会在这里被抓住。
+func openTemp(t testing.TB) *SQLStore {
 	t.Helper()
+	if uri := os.Getenv("TEST_POSTGRES_URI"); uri != "" {
+		return openTempPostgres(t, uri)
+	}
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
 	return st
+}
+
+// openTempPostgres 为每个测试建一个独立 schema（并发跑测试互不干扰），结束后整体 DROP。
+func openTempPostgres(t testing.TB, uri string) *SQLStore {
+	t.Helper()
+	admin, err := sql.Open("pgx", uri)
+	if err != nil {
+		t.Fatalf("open admin conn: %v", err)
+	}
+	schema := fmt.Sprintf("tl_test_%d_%d", time.Now().UnixNano(), rand.Int31())
+	if _, err := admin.Exec(`CREATE SCHEMA ` + schema); err != nil {
+		admin.Close()
+		t.Fatalf("create schema: %v", err)
+	}
+	st, err := Open(withSearchPath(uri, schema))
+	if err != nil {
+		admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		admin.Close()
+		t.Fatalf("Open postgres: %v", err)
+	}
+	t.Cleanup(func() {
+		st.Close()
+		admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		admin.Close()
+	})
+	return st
+}
+
+// withSearchPath 给连接串挂上 search_path 运行时参数（pgx 会原样作为启动参数下发）。
+func withSearchPath(uri, schema string) string {
+	sep := "?"
+	if strings.Contains(uri, "?") {
+		sep = "&"
+	}
+	return uri + sep + "search_path=" + schema
 }
 
 func TestInsertEventDedup(t *testing.T) {

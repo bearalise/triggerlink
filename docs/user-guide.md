@@ -108,7 +108,7 @@ Flag reference:
 | Flag | Default | Description |
 |---|---|---|
 | `-addr` | `:8288` | Event API listen address |
-| `-db` | `triggerlink.db` | SQLite file path (WAL mode; a single file is enough) |
+| `-db` | `triggerlink.db` | Store location: a SQLite file path (WAL mode; a single file is enough), or a `postgres://` / `postgresql://` DSN to use the Postgres backend. The schema is created automatically either way |
 | `-event-key` | (required for `start`) | Bearer key for producers calling `POST /v1/events` |
 | `-signing-key` | (required for `start`) | HMAC signing key used when the platform calls back applications; **must match the application's `SigningKey`** |
 | `-app` | none | Application serve URL; repeat to connect multiple applications |

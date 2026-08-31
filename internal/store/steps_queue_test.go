@@ -66,7 +66,7 @@ func TestCompleteSleepingSteps(t *testing.T) {
 	}
 }
 
-func seedQueueItem(t *testing.T, st *SQLiteStore, id string, at time.Time) {
+func seedQueueItem(t *testing.T, st *SQLStore, id string, at time.Time) {
 	t.Helper()
 	item := QueueItem{ID: id, FunctionID: "process-doc", RunID: "run_1",
 		Score: time.Now().UnixNano(), At: at, Status: QueuePending}
