@@ -213,15 +213,26 @@ func TestWaitResumedByEvent(t *testing.T) {
 	if id != "evt_pay" || name != "order/payed" || string(out["data"]) != `{"order_id":"o1"}` || out["ts"] == nil {
 		t.Fatalf("output fields: %s", sr.Output)
 	}
-	// wait 已 resolved（不再出现在 waiting 集合），恢复跳已入队可租赁
+	// wait 已 resolved（不再出现在 waiting 集合），恢复跳已入队可租赁。
+	// resumeWaits 内 SaveStepResult/SetWaitStatus/Enqueue 是三次独立提交，
+	// waitStepStatus 观察到 memo completed 时入队可能尚未提交——轮询等待。
 	waits, _ := st.WaitingWaitsForEvent(ctx, "order/payed")
 	if len(waits) != 0 {
 		t.Fatalf("wait still waiting: %+v", waits)
 	}
-	items, err := st.LeaseBatch(ctx, time.Now(), time.Minute, 4)
-	if err != nil || len(items) != 1 || items[0].RunID != "run_w" {
-		t.Fatalf("resume queue item: %+v err=%v", items, err)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		items, err := st.LeaseBatch(ctx, time.Now(), time.Minute, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) == 1 && items[0].RunID == "run_w" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	items, err := st.LeaseBatch(ctx, time.Now(), time.Minute, 4)
+	t.Fatalf("resume queue item: %+v err=%v", items, err)
 }
 
 // TestWaitMatchMiss：match 不命中 → 不恢复；空 match → 全部命中。
