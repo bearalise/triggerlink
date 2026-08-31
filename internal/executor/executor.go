@@ -183,6 +183,14 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		return
 	}
+	// 防抖关窗（FR-4.5）：run 一旦开始派发就释放 (function_id, key)，后续事件重新开窗。
+	// 放在回调之前：合并窗口的语义是"到点执行时的最新快照"，而不是"执行期间还能并入"。
+	if fn.Debounce != nil {
+		if err := e.Store.DeleteDebouncePendingByRun(ctx, run.ID); err != nil {
+			slog.Warn("close debounce window failed", "component", "executor",
+				"run_id", run.ID, "function_id", run.FunctionID, "err", err)
+		}
+	}
 	// 函数级重试覆盖（FR-4.2）：未配置用全局 MaxRetries。M0 语义：尝试总数上限。
 	maxAttempts := fn.Retries
 	if maxAttempts <= 0 {

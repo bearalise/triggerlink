@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -124,6 +125,17 @@ type RegisteredFunction struct {
 	Batch    string
 }
 
+// DebouncePending 是一个开着的防抖窗口（FR-4.5）：同 (FunctionID, Key) 的后续事件
+// 并入 RunID 这个 run，并把触发时间推后到 TriggerAt。FirstAt 是窗口内首个事件的时刻，
+// 用于给 debounce.timeout 封顶。窗口在 run 被派发时删除，下个事件重新开窗。
+type DebouncePending struct {
+	FunctionID string
+	Key        string
+	RunID      string
+	FirstAt    time.Time
+	TriggerAt  time.Time
+}
+
 // QueueItem 是队列中的待执行单元；score 决定 FIFO 顺序，at 是"不早于"时间（退避用）。
 type QueueItem struct {
 	ID         string
@@ -167,7 +179,13 @@ type Store interface {
 	ListStepRecords(ctx context.Context, runID string) ([]StepRecord, error)
 	FunctionStats24h(ctx context.Context, since time.Time) (map[string]FunctionStat, error)
 
+	UpdateRunEventSnapshot(ctx context.Context, runID string, e Event) error
+	GetDebouncePending(ctx context.Context, functionID, key string) (DebouncePending, bool, error)
+	UpsertDebouncePending(ctx context.Context, p DebouncePending) error
+	DeleteDebouncePendingByRun(ctx context.Context, runID string) error
+
 	Enqueue(ctx context.Context, item QueueItem) error
+	UpdateQueueItemAt(ctx context.Context, runID string, at time.Time) (int, error)
 	LeaseBatch(ctx context.Context, now time.Time, leaseDur time.Duration, limit int) ([]QueueItem, error)
 	QueueDepth(ctx context.Context) (int, error)
 	ActiveWaitCount(ctx context.Context) (int, error)
@@ -282,6 +300,15 @@ CREATE TABLE IF NOT EXISTS waits (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_waits_run_step ON waits(run_id, step_hash);
 CREATE INDEX IF NOT EXISTS idx_waits_event ON waits(status, event_name);
+CREATE TABLE IF NOT EXISTS debounce_pending (
+  function_id   TEXT NOT NULL,
+  debounce_key  TEXT NOT NULL,
+  run_id        TEXT NOT NULL,
+  first_at      TEXT NOT NULL,
+  trigger_at    TEXT NOT NULL,
+  PRIMARY KEY (function_id, debounce_key)
+);
+CREATE INDEX IF NOT EXISTS idx_debounce_run ON debounce_pending(run_id);
 CREATE TABLE IF NOT EXISTS paused_functions (
   function_id TEXT PRIMARY KEY,
   paused_at   TEXT NOT NULL
@@ -750,6 +777,70 @@ func (s *SQLiteStore) ReleaseLease(ctx context.Context, id string, retryAt time.
 }
 
 // CompleteQueueItem 删除已完成的队列项。
+// --- 防抖窗口（FR-4.5）---
+
+// UpdateRunEventSnapshot 把 run 的触发事件快照替换为最新事件（防抖取尾事件语义）。
+// 只改快照，不动状态/尝试次数：run 尚未开始执行，回调时拿到的就是最后一个事件。
+func (s *SQLiteStore) UpdateRunEventSnapshot(ctx context.Context, runID string, e Event) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE runs SET event_id=?, event_name=?, event_data=?, event_ts=? WHERE id=?`,
+		e.ID, e.Name, string(e.Data), fmtTime(e.TS), runID)
+	return err
+}
+
+// GetDebouncePending 查 (function_id, key) 上是否有开着的窗口。
+func (s *SQLiteStore) GetDebouncePending(ctx context.Context, functionID, key string) (DebouncePending, bool, error) {
+	var p DebouncePending
+	var firstAt, triggerAt string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT function_id, debounce_key, run_id, first_at, trigger_at
+		 FROM debounce_pending WHERE function_id=? AND debounce_key=?`, functionID, key).
+		Scan(&p.FunctionID, &p.Key, &p.RunID, &firstAt, &triggerAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DebouncePending{}, false, nil
+	}
+	if err != nil {
+		return DebouncePending{}, false, err
+	}
+	if p.FirstAt, err = parseTime(firstAt); err != nil {
+		return DebouncePending{}, false, err
+	}
+	if p.TriggerAt, err = parseTime(triggerAt); err != nil {
+		return DebouncePending{}, false, err
+	}
+	return p, true, nil
+}
+
+// UpsertDebouncePending 开窗或续窗：已存在则只推后 trigger_at，run_id 与 first_at
+// 保持首个事件时的值（run 复用，timeout 封顶以首个事件为基准）。
+func (s *SQLiteStore) UpsertDebouncePending(ctx context.Context, p DebouncePending) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO debounce_pending (function_id, debounce_key, run_id, first_at, trigger_at)
+		 VALUES (?,?,?,?,?)
+		 ON CONFLICT(function_id, debounce_key) DO UPDATE SET trigger_at=excluded.trigger_at`,
+		p.FunctionID, p.Key, p.RunID, fmtTime(p.FirstAt), fmtTime(p.TriggerAt))
+	return err
+}
+
+// DeleteDebouncePendingByRun 关窗：run 被派发时调用，键随即释放，下个事件重新开窗。
+func (s *SQLiteStore) DeleteDebouncePendingByRun(ctx context.Context, runID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM debounce_pending WHERE run_id=?`, runID)
+	return err
+}
+
+// UpdateQueueItemAt 把某个 run 仍处于 pending 的队列项推后到 at，返回改动行数。
+// 只动 pending：已租赁的项说明 dispatch 正在进行，此时推后无意义（返回 0，调用方据此
+// 知道这次续窗没落到队列上）。
+func (s *SQLiteStore) UpdateQueueItemAt(ctx context.Context, runID string, at time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE queue_items SET at=? WHERE run_id=? AND status=?`, fmtTime(at), runID, QueuePending)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // --- 保留策略清理（FR-6.6）---
 
 // DeleteRunsBefore 删除 ended_at 早于 cutoff 的终态 run 及其从属记录：

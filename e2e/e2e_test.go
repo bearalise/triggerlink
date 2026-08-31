@@ -1220,3 +1220,87 @@ func TestMetricsEndToEnd(t *testing.T) {
 		t.Fatalf("waits_active=%v, want 0", v)
 	}
 }
+
+// 防抖端到端（FR-4.5）：窗口内连发的事件合并成一个 run，handler 只跑一次，
+// 拿到的是最后一个事件；窗口关闭后的事件重新开窗。
+func TestDebounceMergesEvents(t *testing.T) {
+	var calls atomic.Int32
+	seen := make(chan string, 8)
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "index-doc", Event: "doc/changed",
+			// period 短到测试能等完，但足以覆盖三条事件的连发间隔
+			Debounce: &triggerlink.Debounce{Period: 300 * time.Millisecond, Key: "data.doc_id"},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			calls.Add(1)
+			var d struct {
+				DocID string `json:"doc_id"`
+				Rev   int    `json:"rev"`
+			}
+			json.Unmarshal(in.Event.Data, &d)
+			seen <- fmt.Sprintf("%s@%d", d.DocID, d.Rev)
+			return "ok", nil
+		}, nil)
+
+	for rev := 1; rev <= 3; rev++ {
+		st.sendEvent(t, fmt.Sprintf(`{"name":"doc/changed","data":{"doc_id":"d1","rev":%d}}`, rev))
+		time.Sleep(30 * time.Millisecond)
+	}
+	waitStatus(t, st.store, store.RunCompleted)
+
+	select {
+	case got := <-seen:
+		if got != "d1@3" {
+			t.Fatalf("handler saw %s, want d1@3 (latest event wins)", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never ran")
+	}
+	if n, err := st.store.CountRuns(context.Background()); err != nil || n != 1 {
+		t.Fatalf("runs=%d err=%v, want 1 (three events merged)", n, err)
+	}
+
+	// 窗口已随派发关闭：再发一条事件应开新窗口、产生第二个 run
+	st.sendEvent(t, `{"name":"doc/changed","data":{"doc_id":"d1","rev":4}}`)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n == 2 {
+			if calls.Load() != 2 {
+				t.Fatalf("handler calls=%d, want 2", calls.Load())
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	n, _ := st.store.CountRuns(context.Background())
+	t.Fatalf("second window did not produce a run (runs=%d)", n)
+}
+
+// 不同 debounce key 的事件不互相合并，各自独立成 run。
+func TestDebounceKeyIsolation(t *testing.T) {
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "index-doc-keys", Event: "doc/changed",
+			Debounce: &triggerlink.Debounce{Period: 200 * time.Millisecond, Key: "data.doc_id"},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) { return "ok", nil }, nil)
+
+	st.sendEvent(t, `{"name":"doc/changed","data":{"doc_id":"d1"}}`)
+	st.sendEvent(t, `{"name":"doc/changed","data":{"doc_id":"d2"}}`)
+	st.sendEvent(t, `{"name":"doc/changed","data":{"doc_id":"d1"}}`)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n == 2 {
+			total, _ := st.store.CountRuns(context.Background())
+			if total != 2 {
+				t.Fatalf("runs=%d, want exactly 2 (one per key)", total)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	n, _ := st.store.CountRuns(context.Background())
+	t.Fatalf("expected 2 completed runs, got %d runs", n)
+}

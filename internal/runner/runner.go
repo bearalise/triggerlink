@@ -82,6 +82,17 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 			metrics.EventRouted(metrics.ResultFiltered)
 			continue
 		}
+		// 防抖（FR-4.5）：不直接建 run，交给窗口逻辑合并。
+		if f.Debounce != nil {
+			merged, err := r.routeDebounced(ctx, f, e)
+			if err != nil {
+				return err
+			}
+			if merged {
+				routed++
+			}
+			continue
+		}
 		// run ID 由 (event_id, function_id) 确定性派生：对账扫描与 stream 消费重叠导致
 		// 同一事件被路由两次时，第二次 CreateRun 幂等落空（created=false），不重复入队执行。
 		runID := derivedRunID(e.ID, f.ID)
@@ -127,6 +138,93 @@ func (r *Runner) route(ctx context.Context, e store.Event) error {
 		slog.Error("cancel_on failed", "component", "runner", "event_id", e.ID, "err", err)
 	}
 	return r.Store.MarkEventRouted(ctx, e.ID)
+}
+
+// routeDebounced 处理配置了 debounce 的函数（FR-4.5）：同 (function_id, key) 的事件
+// 在 period 窗口内合并为一个 run，取尾事件。
+//
+//   - 无窗口：建 run（快照 = 本事件）+ 入队 at=now+period + 开窗，返回 created=true。
+//   - 有窗口：把 run 的事件快照换成本事件、把队列项与窗口的触发时间一起推后，run 复用。
+//
+// debounce.timeout 以窗口内首个事件为基准封顶：持续到来的事件不会把触发无限推后。
+// 窗口在 dispatch 时由 executor 删除。竞态边界：事件恰好在 dispatch 租约之后到达时，
+// 队列项已不是 pending，续窗落不到队列上——该事件仍写进了快照，但可能与下一个窗口的
+// run 紧邻产生两个 run。M2 接受这一语义（PRD 记录）。
+func (r *Runner) routeDebounced(ctx context.Context, f registry.Function, e store.Event) (bool, error) {
+	key := evalFlowControlKey(f.Debounce.Key, e)
+	now := time.Now()
+
+	pending, ok, err := r.Store.GetDebouncePending(ctx, f.ID, key)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		if err := r.Store.UpdateRunEventSnapshot(ctx, pending.RunID, e); err != nil {
+			return false, err
+		}
+		at := debounceTriggerAt(now, pending.FirstAt, f.Debounce)
+		if _, err := r.Store.UpdateQueueItemAt(ctx, pending.RunID, at); err != nil {
+			return false, err
+		}
+		pending.TriggerAt = at
+		if err := r.Store.UpsertDebouncePending(ctx, pending); err != nil {
+			return false, err
+		}
+		metrics.EventRouted(metrics.ResultDebounced)
+		slog.Debug("event merged into debounce window", "component", "runner",
+			"event_id", e.ID, "function_id", f.ID, "run_id", pending.RunID,
+			"debounce_key", key, "trigger_at", at)
+		return false, nil
+	}
+
+	runID := derivedRunID(e.ID, f.ID)
+	created, err := r.Store.CreateRun(ctx, store.Run{
+		ID:         runID,
+		FunctionID: f.ID,
+		Status:     store.RunQueued,
+		EventID:    e.ID,
+		EventName:  e.Name,
+		EventData:  e.Data,
+		EventTS:    e.TS,
+	})
+	if err != nil {
+		return false, err
+	}
+	if !created {
+		// 该事件此前已为本函数建过 run（对账重放），窗口早已走完，不重复开窗。
+		return false, nil
+	}
+	at := debounceTriggerAt(now, now, f.Debounce)
+	if err := r.Store.Enqueue(ctx, store.QueueItem{
+		ID:         ids.NewID("qi"),
+		FunctionID: f.ID,
+		RunID:      runID,
+		Score:      now.UnixNano(),
+		At:         at,
+		Status:     store.QueuePending,
+	}); err != nil {
+		return false, err
+	}
+	if err := r.Store.UpsertDebouncePending(ctx, store.DebouncePending{
+		FunctionID: f.ID, Key: key, RunID: runID, FirstAt: now, TriggerAt: at,
+	}); err != nil {
+		return false, err
+	}
+	metrics.EventRouted(metrics.ResultRouted)
+	slog.Debug("debounce window opened", "component", "runner",
+		"event_id", e.ID, "function_id", f.ID, "run_id", runID, "debounce_key", key, "trigger_at", at)
+	return true, nil
+}
+
+// debounceTriggerAt 计算触发时刻：now+period，若配了 timeout 则不超过 firstAt+timeout。
+func debounceTriggerAt(now, firstAt time.Time, d *registry.Debounce) time.Time {
+	at := now.Add(d.Period)
+	if d.Timeout > 0 {
+		if max := firstAt.Add(d.Timeout); at.After(max) {
+			return max
+		}
+	}
+	return at
 }
 
 // resumeWaits 处理到达事件对 waitForEvent 挂起的恢复：命中的 wait 补写 completed memo
