@@ -12,7 +12,7 @@ func seedRunRec(t *testing.T, st *SQLiteStore, id, fnID, status, eventID string)
 	ctx := context.Background()
 	r := Run{ID: id, FunctionID: fnID, EventID: eventID, EventName: "doc/uploaded",
 		EventData: json.RawMessage(`{"doc_id":"d1"}`), EventTS: time.Now()}
-	if err := st.CreateRun(ctx, r); err != nil {
+	if _, err := st.CreateRun(ctx, r); err != nil {
 		t.Fatal(err)
 	}
 	switch status {

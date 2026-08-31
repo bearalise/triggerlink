@@ -63,10 +63,43 @@ At startup, the platform sends one signed GET (no body) to each configured `-app
 | `app_id` | string | App identifier; recorded by the platform, not validated |
 | `functions[].id` | string | Stable function identifier (renaming it loses the association with historical memos) |
 | `functions[].event` | string | Subscribed event name (exact match against the event's `name`) |
+| `functions[].match` | string | Optional event-trigger match expression (FR-3.1), omitted when empty. expr-lang syntax; the evaluation environment contains only `data` (= the arriving event's `data`). The function is triggered only when the event name matches and the expression evaluates true |
+| `functions[].cron` | string | Optional schedule trigger, omitted when empty. Standard 5-field cron (minute hour day-of-month month day-of-week), **UTC** |
 | `functions[].retries` | int | Retry limit; 0 = platform default (4). The M0 platform does not yet differentiate this per function |
 | `functions[].cancel_on` | array | Optional cancel rules: `[{"event": "user/deleted", "match": "data.user_id == event.data.user_id"}]`. When the named event arrives and `match` evaluates true, the platform cancels that function's in-flight (Queued/Running) runs; an omitted `match` means "cancel on arrival". `match` is an expr-lang expression evaluated with `data` = the arriving event's `data` and `event` = the run's triggering event `{"name", "data"}` |
 
 Non-200 response or timeout: the platform logs a warning and skips that app (non-fatal; other apps register as usual).
+
+### 3.1 Cron Trigger Behavior
+
+Functions declaring `cron` are triggered by the platform's scheduler in addition to (or instead of) their event subscription:
+
+- The expression is standard 5-field cron interpreted in **UTC**; the finest granularity is **one minute**.
+- Each tick creates a new run whose triggering event is a platform-generated schedule event.
+- Missed ticks are **not** backfilled: while the platform is down, ticks are simply skipped; after a restart, scheduling resumes from the next tick.
+
+### 3.2 onFailure: Run-Failure Handler (FR-2.11)
+
+When a run reaches the `Failed` terminal state, the platform emits the internal event **`triggerlink/run.failed`** with data:
+
+```json
+{
+  "run_id": "run_...",
+  "function_id": "process-doc",
+  "error": "third-party timeout",
+  "event": { "id": "evt_...", "name": "doc/uploaded", "data": { "doc_id": "d1" }, "ts": "2026-01-01T00:00:00Z" }
+}
+```
+
+(`event` is the run's original triggering event.)
+
+SDKs surface this via an `onFailure` handler in the function options. At serve time the SDK registers an **implicit function** for every function with an `onFailure` handler:
+
+- `id` = `<function id>/on-failure`
+- `event` = `triggerlink/run.failed`
+- `match` = `data.function_id == '<function id>'`
+
+The implicit function is an ordinary function in every respect: it appears in the manifest (visible to the platform and the Dashboard), and its handler may use all step primitives. **No re-entry**: a failure of the onFailure handler's own run does not recursively trigger another `triggerlink/run.failed` handler.
 
 ## 4. POST Execution Callback
 

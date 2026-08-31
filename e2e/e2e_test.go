@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,8 +19,10 @@ import (
 	"github.com/bearalise/triggerlink/internal/dashapi"
 	"github.com/bearalise/triggerlink/internal/eventapi"
 	"github.com/bearalise/triggerlink/internal/executor"
+	"github.com/bearalise/triggerlink/internal/ids"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/runner"
+	"github.com/bearalise/triggerlink/internal/scheduler"
 	"github.com/bearalise/triggerlink/internal/store"
 	triggerlink "github.com/bearalise/triggerlink/sdk"
 	"github.com/bearalise/triggerlink/sdk/step"
@@ -707,5 +710,158 @@ func TestCancelOn(t *testing.T) {
 	}
 	if n, _ := st.store.CountRunsWithStatus(context.Background(), store.RunCompleted); n != 0 {
 		t.Fatal("cancelled run resumed")
+	}
+}
+
+// TestOnFailureCompensation：函数 step 必失败且 Retries=1（首次尝试即耗尽进入 Failed
+// 终态）→ 平台合成内部事件 triggerlink/run.failed → Serve 注册的隐式函数
+// <id>/on-failure 作为普通函数被路由执行，内部 step 原语可用，且收到正确的
+// run_id / function_id / error / 触发事件快照（FR-2.11）。
+func TestOnFailureCompensation(t *testing.T) {
+	var compStepCalls atomic.Int32
+	var failData atomic.Pointer[map[string]any]
+	st := startStack(t,
+		triggerlink.FunctionOpts{
+			ID: "flaky", Event: "flaky/invoked", Retries: 1,
+			OnFailure: func(ctx context.Context, in triggerlink.Input) (any, error) {
+				// 补偿函数内 step 原语可用（memo/恢复语义同普通函数）
+				if _, err := step.Run(ctx, "record", func(ctx context.Context) (any, error) {
+					compStepCalls.Add(1)
+					return "recorded", nil
+				}); err != nil {
+					return nil, err
+				}
+				var data map[string]any
+				if err := json.Unmarshal(in.Event.Data, &data); err != nil {
+					return nil, err
+				}
+				failData.Store(&data)
+				return "compensated", nil
+			},
+		},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			if _, err := step.Run(ctx, "boom", func(ctx context.Context) (any, error) {
+				return nil, fmt.Errorf("boom")
+			}); err != nil {
+				return nil, err
+			}
+			return "never", nil
+		}, nil)
+
+	st.sendEvent(t, `{"name":"flaky/invoked","data":{"doc_id":"d1"}}`)
+	waitStatus(t, st.store, store.RunFailed)
+
+	// 原 run 唯一且已 Failed；补偿事件的 run_id 应指向它
+	runs, err := st.store.ListRuns(context.Background(), store.ListRunsOptions{FunctionID: "flaky"})
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("flaky runs: %v err=%v", runs, err)
+	}
+	failedRun := runs[0]
+
+	// run.failed 事件走 InsertEvent + stream 异步路由 → 隐式函数 run Completed
+	waitCond(t, "compensation run completed", func() bool {
+		runs, _ := st.store.ListRuns(context.Background(),
+			store.ListRunsOptions{FunctionID: "flaky/on-failure", Status: store.RunCompleted})
+		return len(runs) == 1
+	})
+
+	got := failData.Load()
+	if got == nil {
+		t.Fatal("compensation handler did not receive the run.failed event")
+	}
+	data := *got
+	if data["run_id"] != failedRun.ID {
+		t.Fatalf("run_id=%v, want %s", data["run_id"], failedRun.ID)
+	}
+	if data["function_id"] != "flaky" {
+		t.Fatalf("function_id=%v", data["function_id"])
+	}
+	if errStr, _ := data["error"].(string); !strings.Contains(errStr, "boom") {
+		t.Fatalf("error=%v, want contains %q", data["error"], "boom")
+	}
+	evt, _ := data["event"].(map[string]any)
+	if evt["name"] != "flaky/invoked" {
+		t.Fatalf("trigger event snapshot: %v", evt)
+	}
+	if compStepCalls.Load() != 1 {
+		t.Fatalf("compStepCalls=%d, want 1", compStepCalls.Load())
+	}
+}
+
+// TestCronTrigger：函数只配 Cron（不经事件路由）。scheduler 的 check 未导出且为分钟
+// 粒度（真等到点最长一分钟，不适合 e2e），这里按 scheduler.fire 的触发路径直接建
+// run + 入队（EventName=triggerlink/cron，EventData={"ts":<到点>}），端到端验证 cron
+// 触发的 run 被 executor 执行到 Completed，且 handler 收到正确的事件名与 ts（FR-3.2）。
+// scheduler 的到点判定/幂等由 internal/scheduler 单测覆盖。
+func TestCronTrigger(t *testing.T) {
+	var gotName, gotTS atomic.Value
+	s, reg, _ := startStackRaw(t,
+		triggerlink.FunctionOpts{ID: "nightly", Cron: "* * * * *"},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			gotName.Store(in.Event.Name)
+			var data map[string]any
+			if err := json.Unmarshal(in.Event.Data, &data); err != nil {
+				return nil, err
+			}
+			gotTS.Store(data["ts"])
+			return "ok", nil
+		},
+		func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string) {
+			fns, err := registry.Fetch(ctx, http.DefaultClient, appURL, "k")
+			if err != nil {
+				t.Fatalf("introspect: %v", err)
+			}
+			reg.Sync(appURL, fns)
+		})
+
+	// 内省清单携带 cron 表达式，注册表可枚举出 cron 函数（scheduler 的输入）
+	cronFns := reg.CronFunctions()
+	if len(cronFns) != 1 || cronFns[0].ID != "nightly" || cronFns[0].Cron != "* * * * *" {
+		t.Fatalf("cron functions: %+v", cronFns)
+	}
+
+	// 与 scheduler.fire 同构的触发路径：CreateRun + Enqueue
+	at := time.Now().UTC().Truncate(time.Minute)
+	data, _ := json.Marshal(map[string]any{"ts": at.Format(time.RFC3339)})
+	ctx := context.Background()
+	runID := ids.NewID("run")
+	created, err := s.store.CreateRun(ctx, store.Run{
+		ID:         runID,
+		FunctionID: "nightly",
+		Status:     store.RunQueued,
+		EventID:    fmt.Sprintf("cron_nightly_%d", at.Unix()),
+		EventName:  scheduler.EventName,
+		EventData:  data,
+		EventTS:    at,
+	})
+	if err != nil || !created {
+		t.Fatalf("create cron run: created=%v err=%v", created, err)
+	}
+	if err := s.store.Enqueue(ctx, store.QueueItem{
+		ID:         ids.NewID("qi"),
+		FunctionID: "nightly",
+		RunID:      runID,
+		Score:      time.Now().UnixNano(),
+		At:         time.Now(),
+		Status:     store.QueuePending,
+	}); err != nil {
+		t.Fatalf("enqueue cron run: %v", err)
+	}
+
+	waitStatus(t, s.store, store.RunCompleted)
+
+	// run 快照与 handler 收到的事件名/ts 正确
+	runs, err := s.store.ListRuns(ctx, store.ListRunsOptions{FunctionID: "nightly"})
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("nightly runs: %v err=%v", runs, err)
+	}
+	if runs[0].EventName != scheduler.EventName {
+		t.Fatalf("run EventName=%q, want %q", runs[0].EventName, scheduler.EventName)
+	}
+	if gotName.Load() != scheduler.EventName {
+		t.Fatalf("handler event name=%v", gotName.Load())
+	}
+	if gotTS.Load() != at.Format(time.RFC3339) {
+		t.Fatalf("handler ts=%v, want %s", gotTS.Load(), at.Format(time.RFC3339))
 	}
 }

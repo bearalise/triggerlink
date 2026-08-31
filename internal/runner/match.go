@@ -1,4 +1,4 @@
-// match 表达式求值（step.waitForEvent 与 cancelOn 共用，PRD FR-2.6 / FR-4.9）。
+// match 表达式求值（事件触发 match、step.waitForEvent 与 cancelOn 共用，FR-3.1 / FR-2.6 / FR-4.9）。
 // 用 expr-lang/expr；编译结果按表达式字符串缓存（sync.Map），编译/求值失败只记日志、
 // 视为不命中，绝不 panic 中断路由。
 package runner
@@ -43,6 +43,30 @@ func evalMatch(exprStr string, arriving store.Event, run store.Run) bool {
 	hit, ok := out.(bool)
 	if !ok {
 		log.Printf("runner: match %q (run %s): non-bool result %v", exprStr, run.ID, out)
+		return false
+	}
+	return hit
+}
+
+// evalTriggerMatch 判定事件触发 match（FR-3.1）：环境只含 data = 到达事件 data。
+// 空表达式恒命中；编译/求值失败视为不命中（不为该函数建 run）。
+func evalTriggerMatch(exprStr string, arriving store.Event) bool {
+	if exprStr == "" {
+		return true
+	}
+	prog, err := compileMatch(exprStr)
+	if err != nil {
+		log.Printf("runner: trigger match compile %q: %v", exprStr, err)
+		return false
+	}
+	out, err := expr.Run(prog, map[string]any{"data": jsonToAny(arriving.Data)})
+	if err != nil {
+		log.Printf("runner: trigger match eval %q (event %s): %v", exprStr, arriving.ID, err)
+		return false
+	}
+	hit, ok := out.(bool)
+	if !ok {
+		log.Printf("runner: trigger match %q (event %s): non-bool result %v", exprStr, arriving.ID, out)
 		return false
 	}
 	return hit

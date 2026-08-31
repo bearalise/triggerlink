@@ -48,7 +48,7 @@ func newEnv(t *testing.T, appHandler http.HandlerFunc) *env {
 func (e *env) seedRun(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
-	if err := e.store.CreateRun(ctx, store.Run{ID: "run_1", FunctionID: "fn", Status: store.RunQueued,
+	if _, err := e.store.CreateRun(ctx, store.Run{ID: "run_1", FunctionID: "fn", Status: store.RunQueued,
 		EventID: "evt_1", EventName: "e/x", EventData: json.RawMessage(`{"n":1}`), EventTS: time.Now()}); err != nil {
 		t.Fatal(err)
 	}

@@ -269,6 +269,83 @@ test("GET manifest：cancelOn 序列化为 cancel_on，无配置则不出现", a
   assert.ok(!("cancel_on" in plainFn));
 });
 
+test("GET manifest：match/cron 序列化，未配置则不出现", async () => {
+  const fn = createFunction(
+    { id: "nightly-report", event: "report/generate", match: "data.kind == 'full'", cron: "0 9 * * *" },
+    async () => ({}),
+  );
+  const plain = createFunction({ id: "plain", event: "x/y" }, async () => ({}));
+  const { GET } = serve({ client, functions: [fn, plain] });
+
+  const manifest = await (await GET(new Request("http://localhost/api/triggerlink", { headers: signedHeaders() }))).json();
+  const report = manifest.functions.find((f) => f.id === "nightly-report");
+  assert.equal(report.match, "data.kind == 'full'");
+  assert.equal(report.cron, "0 9 * * *");
+  const plainFn = manifest.functions.find((f) => f.id === "plain");
+  assert.ok(!("match" in plainFn) && !("cron" in plainFn));
+});
+
+test("createFunction：纯 cron 函数可省略 event；event/cron 都缺则抛错", async () => {
+  const cronOnly = createFunction({ id: "nightly", cron: "0 9 * * *" }, async () => ({}));
+  const { GET } = serve({ client, functions: [cronOnly] });
+  const manifest = await (await GET(new Request("http://localhost/api/triggerlink", { headers: signedHeaders() }))).json();
+  const f = manifest.functions.find((x) => x.id === "nightly");
+  assert.equal(f.cron, "0 9 * * *");
+  assert.ok(!("event" in f) || f.event === undefined || f.event === "");
+  assert.throws(() => createFunction({ id: "bad" }, async () => ({})), /event or cron is required/);
+});
+
+test("onFailure：注册隐式函数且可被正常回调执行", async () => {
+  const fn = createFunction(
+    {
+      id: "process-doc",
+      event: "doc/uploaded",
+      onFailure: async ({ event, step }) => {
+        return step.run("notify", async () => "notified:" + event.data.run_id + ":" + event.data.error);
+      },
+    },
+    async () => ({}),
+  );
+  const { GET, POST } = serve({ client, functions: [fn] });
+
+  // manifest：隐式函数出现，id/订阅事件/match 断言
+  const manifest = await (await GET(new Request("http://localhost/api/triggerlink", { headers: signedHeaders() }))).json();
+  const implicit = manifest.functions.find((f) => f.id === "process-doc/on-failure");
+  assert.ok(implicit);
+  assert.equal(implicit.event, "triggerlink/run.failed");
+  assert.equal(implicit.match, "data.function_id == 'process-doc'");
+
+  // 回调隐式函数：内部事件 data 透传给 handler
+  const payload = JSON.stringify({
+    ctx: {
+      run_id: "run_of_1",
+      function_id: "process-doc/on-failure",
+      attempt: 1,
+      event: {
+        id: "evt_of",
+        name: "triggerlink/run.failed",
+        data: {
+          run_id: "run_9",
+          function_id: "process-doc",
+          error: "boom",
+          event: { id: "evt_1", name: "doc/uploaded", data: { doc_id: "d1" }, ts: new Date().toISOString() },
+        },
+        ts: new Date().toISOString(),
+      },
+      steps: {},
+    },
+  });
+  const body = new TextEncoder().encode(payload);
+  const resp = await POST(
+    new Request("http://localhost/api/triggerlink", { method: "POST", headers: signedHeaders(body), body }),
+  );
+  const op = await resp.json();
+  assert.equal(resp.status, 200);
+  assert.equal(op.op, "StepComplete");
+  assert.equal(op.step_id, "notify");
+  assert.equal(op.output, "notified:run_9:boom");
+});
+
 test("POST 回调：handler 未捕获异常 → RunError", async () => {
   const fn = createFunction({ id: "panics", event: "x/y" }, async () => {
     throw new Error("bug outside step");

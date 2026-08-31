@@ -4,6 +4,7 @@ go 1.23
 
 require (
 	github.com/expr-lang/expr v1.17.8
+	github.com/robfig/cron/v3 v3.0.1
 	modernc.org/sqlite v1.34.5
 )
 

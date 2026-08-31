@@ -22,9 +22,13 @@ type CancelRule struct {
 }
 
 // Function 是一个已注册的 durable 函数的路由条目。
+// Match 是事件触发的过滤表达式（FR-3.1，expr-lang，环境只含 data）：非空且不命中则不为该函数建 run。
+// Cron 是标准 5 字段 cron 表达式（FR-3.2，UTC，分钟粒度）：非空时由 scheduler 定时触发，不经事件路由。
 type Function struct {
 	ID       string       `json:"id"`
 	Event    string       `json:"event"`
+	Match    string       `json:"match,omitempty"`
+	Cron     string       `json:"cron,omitempty"`
 	Retries  int          `json:"retries"`
 	CancelOn []CancelRule `json:"cancel_on,omitempty"`
 	AppURL   string       `json:"-"`
@@ -91,6 +95,19 @@ func (r *Registry) CancelMatchers(eventName string) []Function {
 				out = append(out, f)
 				break
 			}
+		}
+	}
+	return out
+}
+
+// CronFunctions 返回注册了 cron 表达式的全部函数（FR-3.2，scheduler 轮询用）。
+func (r *Registry) CronFunctions() []Function {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []Function
+	for _, f := range r.byID {
+		if f.Cron != "" {
+			out = append(out, f)
 		}
 	}
 	return out

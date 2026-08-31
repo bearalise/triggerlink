@@ -19,6 +19,14 @@ func Serve(client *Client, fns ...*Function) http.Handler {
 	h := &serveHandler{client: client, byID: map[string]*Function{}}
 	for _, f := range fns {
 		h.byID[f.opts.ID] = f
+		if f.opts.OnFailure != nil {
+			// FR-2.11：注册隐式函数，订阅 run 失败内部事件并按 function_id 过滤
+			h.byID[f.opts.ID+"/on-failure"] = CreateFunction(FunctionOpts{
+				ID:    f.opts.ID + "/on-failure",
+				Event: "triggerlink/run.failed",
+				Match: "data.function_id == '" + f.opts.ID + "'",
+			}, f.opts.OnFailure)
+		}
 	}
 	return h
 }
@@ -57,12 +65,17 @@ func (h *serveHandler) handleManifest(w http.ResponseWriter, r *http.Request) {
 	type fnInfo struct {
 		ID       string     `json:"id"`
 		Event    string     `json:"event"`
+		Match    string     `json:"match,omitempty"`
+		Cron     string     `json:"cron,omitempty"`
 		Retries  int        `json:"retries"`
 		CancelOn []CancelOn `json:"cancel_on,omitempty"`
 	}
 	fns := make([]fnInfo, 0, len(h.byID))
 	for _, f := range h.byID {
-		fns = append(fns, fnInfo{ID: f.opts.ID, Event: f.opts.Event, Retries: f.opts.Retries, CancelOn: f.opts.CancelOn})
+		fns = append(fns, fnInfo{
+			ID: f.opts.ID, Event: f.opts.Event, Match: f.opts.Match, Cron: f.opts.Cron,
+			Retries: f.opts.Retries, CancelOn: f.opts.CancelOn,
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

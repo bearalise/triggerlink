@@ -18,7 +18,7 @@ func seedRun(t *testing.T, st *SQLiteStore) Run {
 		EventData:  json.RawMessage(`{"doc_id":"d1"}`),
 		EventTS:    time.Now(),
 	}
-	if err := st.CreateRun(context.Background(), r); err != nil {
+	if _, err := st.CreateRun(context.Background(), r); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	return r
