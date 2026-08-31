@@ -5,7 +5,7 @@ package runner
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/expr-lang/expr"
@@ -25,7 +25,7 @@ func evalMatch(exprStr string, arriving store.Event, run store.Run) bool {
 	}
 	prog, err := compileMatch(exprStr)
 	if err != nil {
-		log.Printf("runner: match compile %q: %v", exprStr, err)
+		slog.Warn("match compile failed", "component", "runner", "expr", exprStr, "err", err)
 		return false
 	}
 	env := map[string]any{
@@ -37,12 +37,12 @@ func evalMatch(exprStr string, arriving store.Event, run store.Run) bool {
 	}
 	out, err := expr.Run(prog, env)
 	if err != nil {
-		log.Printf("runner: match eval %q (run %s): %v", exprStr, run.ID, err)
+		slog.Warn("match eval failed", "component", "runner", "expr", exprStr, "run_id", run.ID, "err", err)
 		return false
 	}
 	hit, ok := out.(bool)
 	if !ok {
-		log.Printf("runner: match %q (run %s): non-bool result %v", exprStr, run.ID, out)
+		slog.Warn("match returned non-bool", "component", "runner", "expr", exprStr, "run_id", run.ID, "result", out)
 		return false
 	}
 	return hit
@@ -56,17 +56,17 @@ func evalTriggerMatch(exprStr string, arriving store.Event) bool {
 	}
 	prog, err := compileMatch(exprStr)
 	if err != nil {
-		log.Printf("runner: trigger match compile %q: %v", exprStr, err)
+		slog.Warn("trigger match compile failed", "component", "runner", "expr", exprStr, "err", err)
 		return false
 	}
 	out, err := expr.Run(prog, map[string]any{"data": jsonToAny(arriving.Data)})
 	if err != nil {
-		log.Printf("runner: trigger match eval %q (event %s): %v", exprStr, arriving.ID, err)
+		slog.Warn("trigger match eval failed", "component", "runner", "expr", exprStr, "event_id", arriving.ID, "err", err)
 		return false
 	}
 	hit, ok := out.(bool)
 	if !ok {
-		log.Printf("runner: trigger match %q (event %s): non-bool result %v", exprStr, arriving.ID, out)
+		slog.Warn("trigger match returned non-bool", "component", "runner", "expr", exprStr, "event_id", arriving.ID, "result", out)
 		return false
 	}
 	return hit

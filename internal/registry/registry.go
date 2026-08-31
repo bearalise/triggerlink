@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sort"
 	"sync"
@@ -53,7 +53,7 @@ func (f *Function) UnmarshalJSON(b []byte) error {
 	if raw.Timeout != "" {
 		d, err := time.ParseDuration(raw.Timeout)
 		if err != nil {
-			log.Printf("registry: function %s invalid timeout %q, treated as unlimited: %v", raw.ID, raw.Timeout, err)
+			slog.Warn("invalid function timeout, treated as unlimited", "component", "registry", "function_id", raw.ID, "timeout", raw.Timeout, "err", err)
 		} else {
 			f.Timeout = d
 		}

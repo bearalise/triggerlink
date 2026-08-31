@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
@@ -44,7 +44,7 @@ func (e *Executor) Run(ctx context.Context) error {
 	if n, err := e.Store.RequeueExpiredLeases(ctx, time.Now()); err != nil {
 		return err
 	} else if n > 0 {
-		log.Printf("executor: reconciled %d expired leases", n)
+		slog.Info("reconciled expired leases", "component", "executor", "count", n)
 	}
 
 	var mu sync.Mutex
@@ -64,7 +64,7 @@ func (e *Executor) Run(ctx context.Context) error {
 		}
 		items, err := e.Store.LeaseBatch(ctx, time.Now(), e.LeaseDuration, e.BatchSize)
 		if err != nil {
-			log.Printf("executor: lease: %v", err)
+			slog.Error("lease batch failed", "component", "executor", "err", err)
 			continue
 		}
 		for _, it := range items {
@@ -168,7 +168,7 @@ type sendEventIn struct {
 func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	run, err := e.Store.GetRun(ctx, item.RunID)
 	if err != nil {
-		log.Printf("executor: get run %s: %v", item.RunID, err)
+		slog.Error("get run failed", "component", "executor", "run_id", item.RunID, "err", err)
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		return
 	}
@@ -189,13 +189,13 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	}
 	attempt, err := e.Store.IncrementRunAttempt(ctx, run.ID)
 	if err != nil {
-		log.Printf("executor: attempt %s: %v", run.ID, err)
+		slog.Error("increment attempt failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 		e.Store.ReleaseLease(ctx, item.ID, time.Now().Add(e.BaseBackoff))
 		return
 	}
 	running, err := e.Store.MarkRunRunning(ctx, run.ID)
 	if err != nil {
-		log.Printf("executor: mark running %s: %v", run.ID, err)
+		slog.Error("mark run running failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 		e.Store.ReleaseLease(ctx, item.ID, time.Now().Add(e.BaseBackoff))
 		return
 	}
@@ -238,12 +238,15 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-TriggerLink-Signature", sign.Sign(e.SigningKey, body, time.Now()))
 
+	started := time.Now()
 	resp, err := e.Client.Do(httpReq)
 	if err != nil {
 		e.retryOrFail(ctx, item, run, attempt, maxAttempts, "callback: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	slog.Debug("callback returned", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID,
+		"attempt", attempt, "status", resp.StatusCode, "duration", time.Since(started))
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if resp.StatusCode != http.StatusOK {
 		e.retryOrFail(ctx, item, run, attempt, maxAttempts, fmt.Sprintf("app status %d: %s", resp.StatusCode, truncate(string(respBody), 200)))
@@ -260,7 +263,8 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	if latest, err := e.Store.GetRun(ctx, run.ID); err == nil &&
 		(latest.Status == store.RunCancelled || latest.Status == store.RunCompleted || latest.Status == store.RunFailed) {
 		e.Store.CompleteQueueItem(ctx, item.ID)
-		log.Printf("executor: run %s reached %s in flight, discarding %s", run.ID, latest.Status, op.Op)
+		slog.Info("run reached terminal state in flight, discarding opcode", "component", "executor",
+			"run_id", run.ID, "function_id", run.FunctionID, "status", latest.Status, "op", op.Op)
 		return
 	}
 
@@ -289,7 +293,7 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 			Status: store.StepSleeping, Attempt: attempt})
 		e.Store.CompleteQueueItem(ctx, item.ID)
 		e.enqueueNext(ctx, run, op.Until)
-		log.Printf("executor: run %s sleeping until %s", run.ID, op.Until.Format(time.RFC3339))
+		slog.Debug("run sleeping", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "step_id", op.StepID, "until", op.Until.Format(time.RFC3339))
 	case "SendEvent":
 		e.handleSendEvent(ctx, item, run, attempt, maxAttempts, op)
 	case "WaitForEvent":
@@ -297,7 +301,8 @@ func (e *Executor) dispatch(ctx context.Context, item store.QueueItem) {
 	case "RunComplete":
 		e.Store.CompleteRun(ctx, run.ID, op.Output)
 		e.Store.CompleteQueueItem(ctx, item.ID)
-		log.Printf("executor: run %s completed", run.ID)
+		slog.Info("run completed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID,
+			"attempt", attempt, "duration", time.Since(run.CreatedAt))
 	case "RunError":
 		e.retryOrFail(ctx, item, run, attempt, maxAttempts, opcodeErrMsg(op, "run error"))
 	default:
@@ -346,7 +351,7 @@ func (e *Executor) handleSendEvent(ctx context.Context, item store.QueueItem, ru
 		Status: store.StepCompleted, Output: out, Attempt: attempt})
 	e.Store.CompleteQueueItem(ctx, item.ID)
 	e.enqueueNext(ctx, run, time.Now()) // 扇出后立即推进（不中断函数）
-	log.Printf("executor: run %s sent %d event(s)", run.ID, len(idsOut))
+	slog.Debug("run sent events", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "step_id", op.StepID, "count", len(idsOut))
 }
 
 // derivedEventID 为缺省 ID 的扇出事件派生确定性 ID（崩溃重试幂等的前提）。
@@ -386,7 +391,7 @@ func (e *Executor) handleWaitForEvent(ctx context.Context, item store.QueueItem,
 		return
 	}
 	e.Store.CompleteQueueItem(ctx, item.ID)
-	log.Printf("executor: run %s waiting for event %s", run.ID, op.Event)
+	slog.Debug("run waiting for event", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "step_id", op.StepID, "event", op.Event)
 }
 
 // scanRunTimeouts 扫描 run 级超时（FR-4.3）：对注册了 Timeout 的函数，其在途 run
@@ -399,7 +404,7 @@ func (e *Executor) scanRunTimeouts(ctx context.Context) {
 		}
 		runs, err := e.Store.ActiveRunsByFunction(ctx, fn.ID)
 		if err != nil {
-			log.Printf("executor: timeout scan list runs for %s: %v", fn.ID, err)
+			slog.Error("timeout scan list runs failed", "component", "executor", "function_id", fn.ID, "err", err)
 			continue
 		}
 		for _, run := range runs {
@@ -409,12 +414,12 @@ func (e *Executor) scanRunTimeouts(ctx context.Context) {
 			msg := fmt.Sprintf("run timeout after %s", fn.Timeout)
 			transitioned, err := e.Store.TimeoutRun(ctx, run.ID, msg)
 			if err != nil {
-				log.Printf("executor: timeout run %s: %v", run.ID, err)
+				slog.Error("timeout run failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 				continue
 			}
 			if transitioned {
 				e.emitRunFailed(ctx, run, msg)
-				log.Printf("executor: run %s timed out (%s)", run.ID, msg)
+				slog.Warn("run timed out", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "timeout", fn.Timeout, "duration", time.Since(run.CreatedAt))
 			}
 		}
 	}
@@ -424,10 +429,12 @@ func (e *Executor) retryOrFail(ctx context.Context, item store.QueueItem, run st
 	if attempt >= maxAttempts {
 		e.failRun(ctx, run, msg)
 		e.Store.CompleteQueueItem(ctx, item.ID)
-		log.Printf("executor: run %s failed after %d attempts: %s", run.ID, attempt, msg)
+		slog.Error("run failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID,
+			"attempt", attempt, "duration", time.Since(run.CreatedAt), "error", msg)
 		return
 	}
-	log.Printf("executor: run %s attempt %d failed, retrying: %s", run.ID, attempt, msg)
+	slog.Warn("run attempt failed, retrying", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID,
+		"attempt", attempt, "max_attempts", maxAttempts, "backoff", e.backoff(attempt), "error", msg)
 	e.Store.ReleaseLease(ctx, item.ID, time.Now().Add(e.backoff(attempt)))
 }
 
@@ -435,7 +442,7 @@ func (e *Executor) retryOrFail(ctx context.Context, item store.QueueItem, run st
 // triggerlink/run.failed，供用户以普通函数（订阅该事件 + match function_id）做 onFailure 补偿。
 func (e *Executor) failRun(ctx context.Context, run store.Run, errMsg string) {
 	if err := e.Store.FailRun(ctx, run.ID, errMsg); err != nil {
-		log.Printf("executor: fail run %s: %v", run.ID, err)
+		slog.Error("fail run failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 		return
 	}
 	e.emitRunFailed(ctx, run, errMsg)
@@ -452,13 +459,13 @@ func (e *Executor) emitRunFailed(ctx context.Context, run store.Run, errMsg stri
 		"event":       eventPayload{ID: run.EventID, Name: run.EventName, Data: run.EventData, TS: run.EventTS},
 	})
 	if err != nil {
-		log.Printf("executor: marshal run.failed for run %s: %v", run.ID, err)
+		slog.Error("marshal run.failed event failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 		return
 	}
 	evt := store.Event{ID: "runfailed_" + run.ID, Name: "triggerlink/run.failed", Data: data, TS: time.Now()}
 	inserted, err := e.Store.InsertEvent(ctx, evt)
 	if err != nil {
-		log.Printf("executor: insert run.failed for run %s: %v", run.ID, err)
+		slog.Error("insert run.failed event failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 		return
 	}
 	if inserted && e.Stream != nil {
@@ -483,7 +490,7 @@ func (e *Executor) enqueueNext(ctx context.Context, run store.Run, at time.Time)
 		At:         at,
 		Status:     store.QueuePending,
 	}); err != nil {
-		log.Printf("executor: enqueue next for run %s: %v", run.ID, err)
+		slog.Error("enqueue next hop failed", "component", "executor", "run_id", run.ID, "function_id", run.FunctionID, "err", err)
 	}
 }
 

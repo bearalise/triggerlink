@@ -88,9 +88,14 @@ TRIGGERLINK_SIGNING_KEY=<SIGNING_KEY> ./your-app &      # listens on :8080
   -app http://<app-B-address>:3000/api/triggerlink
 ```
 
-Seeing `registered function <id> (event=<name>)` in the startup logs means registration succeeded; `warn: introspect` means the corresponding app is not up or its signing key does not match.
+Seeing `level=INFO msg="registered function" function_id=<id> event=<name>` in the startup logs means registration succeeded; `level=WARN msg="introspect app"` means the corresponding app is not up or its signing key does not match.
 
 See the "Deploying the Platform" section of the [User Guide](user-guide.md) for a full description of all flags.
+
+### Logging
+
+- Logs are structured key/value lines (Go `log/slog` text handler) on stderr; under systemd they land in journald as-is (`journalctl -u triggerlink`).
+- `-log-level debug|info|warn|error` (default `info`, or env `TRIGGERLINK_LOG_LEVEL`) controls verbosity. `debug` adds per-event routing, callback durations, and step suspend/resume lines — useful when tracing a single run, noisy under load.
 
 ### Dashboard Authentication
 

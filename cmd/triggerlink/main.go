@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"log"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,13 +40,19 @@ func (s *stringSlice) Set(v string) error {
 	return nil
 }
 
+// fatal 记录 error 级日志后退出（替代 log.Fatal：保持结构化输出格式一致）。
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
+}
+
 func main() {
 	// 子命令：triggerlink start（生产，密钥必填）/ triggerlink dev（本地开发，密钥缺省自动生成）。
 	// 无子命令时按 start 处理（兼容旧的 flag 直传用法）。
 	cmd := "start"
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "version" {
-		log.Printf("triggerlink %s", version)
+		fmt.Printf("triggerlink %s\n", version)
 		return
 	}
 	if len(args) > 0 && (args[0] == "start" || args[0] == "dev") {
@@ -53,33 +61,41 @@ func main() {
 
 	var addr, dbPath, eventKey, signingKey string
 	var apps stringSlice
-	var dashAuth string
+	var dashAuth, logLevel string
 	fs := flag.NewFlagSet("triggerlink "+cmd, flag.ExitOnError)
 	fs.StringVar(&addr, "addr", ":8288", "Event API 监听地址")
 	fs.StringVar(&dbPath, "db", "triggerlink.db", "SQLite 数据库路径")
 	fs.StringVar(&eventKey, "event-key", "", "Event API 鉴权 key（start 必填，dev 缺省自动生成）")
 	fs.StringVar(&signingKey, "signing-key", "", "平台→应用回调签名密钥（start 必填，dev 缺省自动生成）")
 	fs.StringVar(&dashAuth, "dashboard-auth", "", "Dashboard basic auth 凭据 user:password（默认读 TRIGGERLINK_DASHBOARD_AUTH；都为空则生成随机密码打日志）")
+	fs.StringVar(&logLevel, "log-level", "", "日志级别 debug|info|warn|error（默认 info；env TRIGGERLINK_LOG_LEVEL 兜底）")
 	fs.Var(&apps, "app", "应用 serve URL（可重复，如 http://localhost:8080/api/triggerlink）")
 	fs.Parse(args)
+
+	// 结构化日志（FR-6.3）：全局 slog 默认 handler，尽早设置——之后所有包的 slog 调用共用。
+	level, badLevel := parseLogLevel(logLevel)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	if badLevel != "" {
+		slog.Warn("unknown log level, falling back to info", "value", badLevel)
+	}
 
 	if cmd == "dev" {
 		if eventKey == "" {
 			eventKey = ids.NewID("evtkey")
-			log.Printf("dev: 自动生成 event-key=%s", eventKey)
+			slog.Info("dev: generated event key", "event_key", eventKey)
 		}
 		if signingKey == "" {
 			signingKey = ids.NewID("signkey")
-			log.Printf("dev: 自动生成 signing-key=%s", signingKey)
+			slog.Info("dev: generated signing key", "signing_key", signingKey)
 		}
 	}
 	if eventKey == "" || signingKey == "" {
-		log.Fatal("必须提供 -event-key 与 -signing-key（或使用 triggerlink dev 自动生成）")
+		fatal("必须提供 -event-key 与 -signing-key（或使用 triggerlink dev 自动生成）")
 	}
 
 	st, err := store.Open(dbPath)
 	if err != nil {
-		log.Fatalf("open store: %v", err)
+		fatal("open store", "db", dbPath, "err", err)
 	}
 	defer st.Close()
 
@@ -102,14 +118,14 @@ func main() {
 		return st.ReplaceAppFunctions(ctx, appURL, rfns)
 	}
 	if rfns, err := st.LoadRegisteredFunctions(ctx); err != nil {
-		log.Printf("warn: load persisted registrations: %v", err)
+		slog.Warn("load persisted registrations", "err", err)
 	} else {
 		byApp := map[string][]registry.Function{}
 		for _, rf := range rfns {
 			var cancelOn []registry.CancelRule
 			if rf.CancelOn != "" {
 				if err := json.Unmarshal([]byte(rf.CancelOn), &cancelOn); err != nil {
-					log.Printf("warn: decode cancel_on of function %s: %v", rf.ID, err)
+					slog.Warn("decode cancel_on", "function_id", rf.ID, "err", err)
 				}
 			}
 			byApp[rf.AppURL] = append(byApp[rf.AppURL],
@@ -119,7 +135,7 @@ func main() {
 			reg.Sync(appURL, fns)
 		}
 		if len(byApp) > 0 {
-			log.Printf("restored %d app registration(s) from db", len(byApp))
+			slog.Info("restored app registrations from db", "apps", len(byApp))
 		}
 	}
 
@@ -128,15 +144,15 @@ func main() {
 	for _, app := range apps {
 		fns, err := registry.Fetch(ctx, introspectClient, app, signingKey)
 		if err != nil {
-			log.Printf("warn: introspect %s: %v", app, err)
+			slog.Warn("introspect app", "app_url", app, "err", err)
 			continue
 		}
 		reg.Sync(app, fns)
 		if err := persist(ctx, app, fns); err != nil {
-			log.Printf("warn: persist registration %s: %v", app, err)
+			slog.Warn("persist registration", "app_url", app, "err", err)
 		}
 		for _, f := range fns {
-			log.Printf("registered function %s (event=%s) from %s", f.ID, f.Event, app)
+			slog.Info("registered function", "function_id", f.ID, "event", f.Event, "app_url", app)
 		}
 	}
 
@@ -146,17 +162,17 @@ func main() {
 	sched := &scheduler.Scheduler{Store: st, Reg: reg}
 	go func() {
 		if err := rnr.Run(ctx); err != nil {
-			log.Printf("runner exited: %v", err)
+			slog.Error("runner exited", "err", err)
 		}
 	}()
 	go func() {
 		if err := exec.Run(ctx); err != nil {
-			log.Printf("executor exited: %v", err)
+			slog.Error("executor exited", "err", err)
 		}
 	}()
 	go func() {
 		if err := sched.Run(ctx); err != nil {
-			log.Printf("scheduler exited: %v", err)
+			slog.Error("scheduler exited", "err", err)
 		}
 	}()
 
@@ -186,9 +202,32 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("triggerlink %s [%s] listening on %s (db=%s, apps=%d)", version, cmd, addr, dbPath, len(apps))
+	slog.Info("triggerlink listening", "version", version, "mode", cmd, "addr", addr, "db", dbPath, "apps", len(apps))
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+		fatal("http server", "err", err)
+	}
+}
+
+// parseLogLevel 解析日志级别：flag 优先，env TRIGGERLINK_LOG_LEVEL 兜底，缺省 info。
+// 非法值退回 info，并把原值作为第二返回值交给调用方告警（此时 handler 尚未装好，不能直接打日志）。
+func parseLogLevel(flagVal string) (slog.Level, string) {
+	v := flagVal
+	if v == "" {
+		v = os.Getenv("TRIGGERLINK_LOG_LEVEL")
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return slog.LevelInfo, ""
+	case "debug":
+		return slog.LevelDebug, ""
+	case "info":
+		return slog.LevelInfo, ""
+	case "warn", "warning":
+		return slog.LevelWarn, ""
+	case "error":
+		return slog.LevelError, ""
+	default:
+		return slog.LevelInfo, v
 	}
 }
 
@@ -200,12 +239,12 @@ func resolveDashAuth(flagVal string) (string, string) {
 	}
 	if v == "" {
 		pass := ids.NewID("dash")
-		log.Printf("dashboard auth 未配置，生成随机凭据：user=admin password=%s（仅适合内网/本地使用）", pass)
+		slog.Warn("dashboard auth 未配置，生成随机凭据（仅适合内网/本地使用）", "user", "admin", "password", pass)
 		return "admin", pass
 	}
 	user, pass, err := auth.ParseCreds(v)
 	if err != nil {
-		log.Fatalf("-dashboard-auth: %v", err)
+		fatal("-dashboard-auth", "err", err)
 	}
 	return user, pass
 }
