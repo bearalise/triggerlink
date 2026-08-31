@@ -253,3 +253,114 @@ func TestCancelRunEndpoint(t *testing.T) {
 		t.Fatalf("get cancel path: %d", rec.Code)
 	}
 }
+
+// TestReplayRunEndpoint：POST /api/v1/runs/{id}/replay（FR-6.2）——
+// 以原 run 的触发事件快照创建全新 run（新 ID、Queued、at=now 入队），
+// 不继承 step memo；不存在的 run → 404。
+func TestReplayRunEndpoint(t *testing.T) {
+	h, st, reg := newTestHandler(t)
+	ctx := context.Background()
+	runID := seed(t, st, reg) // seed 一个 completed run（含两个 step memo）
+
+	post := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 不存在 → 404
+	if rec := post("/api/v1/runs/run_none/replay"); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing: %d", rec.Code)
+	}
+
+	rec := post("/api/v1/runs/" + runID + "/replay")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replay: %d %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		RunID string `json:"run_id"`
+	}
+	decode(t, rec, &out)
+	if out.RunID == "" || out.RunID == runID {
+		t.Fatalf("new run id: %q", out.RunID)
+	}
+
+	// 新 run 继承触发事件快照，状态 Queued
+	nr, err := st.GetRun(ctx, out.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nr.Status != store.RunQueued || nr.FunctionID != "fn-a" ||
+		nr.EventID != "evt_0000000000001aaa" || nr.EventName != "doc/uploaded" ||
+		string(nr.EventData) != `{"doc_id":"d1"}` {
+		t.Fatalf("replay run: %+v", nr)
+	}
+	// step memo 按 run_id 隔离：不继承原 run 的 memo
+	steps, err := st.StepResults(ctx, out.RunID)
+	if err != nil || len(steps) != 0 {
+		t.Fatalf("replay run must not inherit memo: %+v err=%v", steps, err)
+	}
+	// 已以 at=now 入队：立即可租赁
+	items, err := st.LeaseBatch(ctx, time.Now(), time.Minute, 4)
+	if err != nil || len(items) != 1 || items[0].RunID != out.RunID {
+		t.Fatalf("queue items: %+v err=%v", items, err)
+	}
+}
+
+// TestPauseResumeEndpoints：POST /api/v1/functions/{id}/pause|resume（FR-7.3）——
+// 200 {} 且状态翻转；functions 列表带 paused 标志；未注册函数也可暂停（幂等置位）。
+func TestPauseResumeEndpoints(t *testing.T) {
+	h, st, reg := newTestHandler(t)
+	seed(t, st, reg)
+
+	post := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	pausedFlag := func() bool {
+		t.Helper()
+		rec := doGet(t, h, "/api/v1/functions")
+		var out struct {
+			Functions []struct {
+				ID     string `json:"id"`
+				Paused bool   `json:"paused"`
+			} `json:"functions"`
+		}
+		decode(t, rec, &out)
+		for _, f := range out.Functions {
+			if f.ID == "fn-a" {
+				return f.Paused
+			}
+		}
+		t.Fatal("fn-a missing in functions list")
+		return false
+	}
+
+	if pausedFlag() {
+		t.Fatal("fn-a must not be paused initially")
+	}
+	if rec := post("/api/v1/functions/fn-a/pause"); rec.Code != http.StatusOK {
+		t.Fatalf("pause: %d %s", rec.Code, rec.Body)
+	}
+	if paused, _ := st.IsFunctionPaused(context.Background(), "fn-a"); !paused {
+		t.Fatal("fn-a not paused in store")
+	}
+	if !pausedFlag() {
+		t.Fatal("functions list must show paused=true")
+	}
+	if rec := post("/api/v1/functions/fn-a/resume"); rec.Code != http.StatusOK {
+		t.Fatalf("resume: %d %s", rec.Code, rec.Body)
+	}
+	if pausedFlag() {
+		t.Fatal("functions list must show paused=false after resume")
+	}
+	// 未注册函数也可暂停（幂等置位，200 {}）
+	if rec := post("/api/v1/functions/fn-ghost/pause"); rec.Code != http.StatusOK {
+		t.Fatalf("pause ghost: %d", rec.Code)
+	}
+}

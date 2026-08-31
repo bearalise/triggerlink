@@ -48,6 +48,15 @@ func startStackRaw(t *testing.T, opts triggerlink.FunctionOpts,
 func startStackFns(t *testing.T, fns []*triggerlink.Function,
 	beforeStart func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string)) (*stack, *registry.Registry, string) {
 	t.Helper()
+	return startStackFull(t, fns, beforeStart, nil)
+}
+
+// startStackFull 与 startStackFns 同，tweakExec 非 nil 时在 executor 启动前调整其配置
+//（如调小 TimeoutScanInterval 加速 run 超时扫描）。
+func startStackFull(t *testing.T, fns []*triggerlink.Function,
+	beforeStart func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string),
+	tweakExec func(*executor.Executor)) (*stack, *registry.Registry, string) {
+	t.Helper()
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -72,6 +81,9 @@ func startStackFns(t *testing.T, fns []*triggerlink.Function,
 		BaseBackoff: 10 * time.Millisecond,
 		Stream: stream,
 	}
+	if tweakExec != nil {
+		tweakExec(exec)
+	}
 	if beforeStart != nil {
 		beforeStart(ctx, st, reg, app.URL)
 	}
@@ -81,6 +93,27 @@ func startStackFns(t *testing.T, fns []*triggerlink.Function,
 	eventSrv := httptest.NewServer(eventapi.NewHandler(st, "dev-key", stream))
 	t.Cleanup(eventSrv.Close)
 	return &stack{store: st, eventURL: eventSrv.URL}, reg, app.URL
+}
+
+// mountDash 挂一个 dashapi httptest server（写端点：replay/pause/resume），不带 basic auth。
+func mountDash(t *testing.T, st *store.SQLiteStore, reg *registry.Registry) string {
+	t.Helper()
+	srv := httptest.NewServer(dashapi.NewHandler(st, reg))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// dashPost 调管理 API 写端点，返回状态码与 JSON 响应体。
+func dashPost(t *testing.T, dashURL, path string) (int, map[string]any) {
+	t.Helper()
+	resp, err := http.Post(dashURL+path, "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	return resp.StatusCode, body
 }
 
 // startStack 组装：store + runner + executor + eventapi(httptest) + sdk app(httptest)。
@@ -863,5 +896,158 @@ func TestCronTrigger(t *testing.T) {
 	}
 	if gotTS.Load() != at.Format(time.RFC3339) {
 		t.Fatalf("handler ts=%v, want %s", gotTS.Load(), at.Format(time.RFC3339))
+	}
+}
+
+// registerApp 是 startStackRaw/startStackFull 的 beforeStart：内省 app 并同步注册表
+//（runner 启动前完成，与 startStack 的注册路径一致）。
+func registerApp(t *testing.T) func(context.Context, *store.SQLiteStore, *registry.Registry, string) {
+	t.Helper()
+	return func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string) {
+		fns, err := registry.Fetch(ctx, http.DefaultClient, appURL, "k")
+		if err != nil {
+			t.Fatalf("introspect: %v", err)
+		}
+		reg.Sync(appURL, fns)
+	}
+}
+
+// TestReplayFailedRun：失败 run 经管理 API replay 出全新 run（新 id，不继承 step
+// memo）。用 atomic 开关翻转行为：首次必失败 → run Failed；replay 前翻转为成功 →
+// 新 run Completed 且 step 计数器再次 +1（证明 memo 未继承、step 真实重跑，FR-6.2）。
+func TestReplayFailedRun(t *testing.T) {
+	var failMode atomic.Bool
+	failMode.Store(true)
+	var workCalls atomic.Int32
+	s, reg, _ := startStackRaw(t,
+		triggerlink.FunctionOpts{ID: "flaky-replay", Event: "flaky/invoked", Retries: 1},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			if _, err := step.Run(ctx, "work", func(ctx context.Context) (any, error) {
+				workCalls.Add(1)
+				if failMode.Load() {
+					return nil, fmt.Errorf("boom")
+				}
+				return "ok", nil
+			}); err != nil {
+				return nil, err
+			}
+			return "done", nil
+		}, registerApp(t))
+	dashURL := mountDash(t, s.store, reg)
+	ctx := context.Background()
+
+	s.sendEvent(t, `{"name":"flaky/invoked","data":{}}`)
+	waitStatus(t, s.store, store.RunFailed)
+	runs, err := s.store.ListRuns(ctx, store.ListRunsOptions{FunctionID: "flaky-replay"})
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs: %v err=%v", runs, err)
+	}
+	orig := runs[0]
+	if workCalls.Load() != 1 {
+		t.Fatalf("workCalls=%d, want 1", workCalls.Load())
+	}
+
+	// 不存在的 run → 404
+	if code, _ := dashPost(t, dashURL, "/api/v1/runs/run_nonexistent/replay"); code != http.StatusNotFound {
+		t.Fatalf("replay nonexistent: %d", code)
+	}
+
+	// 翻转行为后 replay：返回新 run_id ≠ 原 id
+	failMode.Store(false)
+	code, body := dashPost(t, dashURL, "/api/v1/runs/"+orig.ID+"/replay")
+	if code != http.StatusOK {
+		t.Fatalf("replay: %d body=%v", code, body)
+	}
+	newID, _ := body["run_id"].(string)
+	if newID == "" || newID == orig.ID {
+		t.Fatalf("replay run_id=%q, want new id (orig %s)", newID, orig.ID)
+	}
+
+	// 新 run 从头执行到 Completed；step 真实重跑（计数器再 +1）
+	waitCond(t, "replay run completed", func() bool {
+		run, err := s.store.GetRun(ctx, newID)
+		return err == nil && run.Status == store.RunCompleted
+	})
+	if workCalls.Load() != 2 {
+		t.Fatalf("workCalls=%d, want 2 (replay 不继承 memo，step 应重跑)", workCalls.Load())
+	}
+}
+
+// TestPauseResumeFunction：pause 后事件照收但不建 run；resume 后新事件正常触发（FR-7.3）。
+func TestPauseResumeFunction(t *testing.T) {
+	var calls atomic.Int32
+	s, reg, _ := startStackRaw(t,
+		triggerlink.FunctionOpts{ID: "pausable", Event: "doc/uploaded"},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			calls.Add(1)
+			return "ok", nil
+		}, registerApp(t))
+	dashURL := mountDash(t, s.store, reg)
+	ctx := context.Background()
+
+	// pause → 发事件 → 不建 run
+	if code, _ := dashPost(t, dashURL, "/api/v1/functions/pausable/pause"); code != http.StatusOK {
+		t.Fatalf("pause: %d", code)
+	}
+	s.sendEvent(t, `{"name":"doc/uploaded","data":{"doc_id":"paused"}}`)
+	time.Sleep(300 * time.Millisecond)
+	if n, _ := s.store.CountRuns(ctx); n != 0 {
+		t.Fatalf("runs=%d while paused, want 0", n)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("handler called %d times while paused", calls.Load())
+	}
+
+	// resume → 再发事件 → 正常触发到 Completed
+	if code, _ := dashPost(t, dashURL, "/api/v1/functions/pausable/resume"); code != http.StatusOK {
+		t.Fatalf("resume: %d", code)
+	}
+	s.sendEvent(t, `{"name":"doc/uploaded","data":{"doc_id":"resumed"}}`)
+	waitStatus(t, s.store, store.RunCompleted)
+	if calls.Load() != 1 {
+		t.Fatalf("calls=%d, want 1", calls.Load())
+	}
+	if n, _ := s.store.CountRuns(ctx); n != 1 {
+		t.Fatalf("runs=%d, want 1", n)
+	}
+}
+
+// TestRunTimeout：函数配 Timeout=2s，handler 在 step A 后 Sleep(30s) 挂起 →
+// run 从 created_at 起超时仍在 Running → 平台置 Failed，error 含 "run timeout"
+//（FR-4.3）。TimeoutScanInterval 调小到 10ms 加速扫描；Timeout 取 2s 以容忍
+// 全量测试负载下首个回调的调度延迟（300ms 在高负载时会在回调发生前误杀 run）。
+func TestRunTimeout(t *testing.T) {
+	var aCount atomic.Int32
+	fn := triggerlink.CreateFunction(
+		triggerlink.FunctionOpts{ID: "slow", Event: "doc/uploaded", Timeout: 2 * time.Second},
+		func(ctx context.Context, in triggerlink.Input) (any, error) {
+			if _, err := step.Run(ctx, "a", func(ctx context.Context) (any, error) {
+				aCount.Add(1)
+				return "a", nil
+			}); err != nil {
+				return nil, err
+			}
+			step.Sleep(ctx, "nap", 30*time.Second) // 挂起 30s，远超 run 超时
+			return "done", nil
+		})
+	s, _, _ := startStackFull(t, []*triggerlink.Function{fn}, registerApp(t),
+		func(exec *executor.Executor) { exec.TimeoutScanInterval = 10 * time.Millisecond })
+
+	s.sendEvent(t, `{"name":"doc/uploaded","data":{}}`)
+	waitStatus(t, s.store, store.RunFailed)
+
+	runs, err := s.store.ListRuns(context.Background(), store.ListRunsOptions{FunctionID: "slow"})
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs: %v err=%v", runs, err)
+	}
+	run, err := s.store.GetRun(context.Background(), runs[0].ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if !strings.Contains(run.Error, "run timeout") {
+		t.Fatalf("run error=%q, want contains %q", run.Error, "run timeout")
+	}
+	if aCount.Load() != 1 {
+		t.Fatalf("a=%d, want 1", aCount.Load())
 	}
 }

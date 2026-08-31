@@ -1,5 +1,7 @@
 // Package dashapi 实现 Dashboard 的管理 API（PRD 9.3）：以只读端点为主，
-// 另提供 POST /api/v1/runs/{id}/cancel 用于主动取消在途 run。
+// 另提供写端点：POST /api/v1/runs/{id}/cancel（取消在途 run）、
+// POST /api/v1/runs/{id}/replay（失败 run 一键重跑，FR-6.2）、
+// POST /api/v1/functions/{id}/pause|resume（函数暂停/恢复，FR-7.3）。
 // 鉴权由外层中间件负责（internal/auth），本包不含鉴权逻辑。
 package dashapi
 
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bearalise/triggerlink/internal/ids"
 	"github.com/bearalise/triggerlink/internal/registry"
 	"github.com/bearalise/triggerlink/internal/store"
 )
@@ -46,10 +49,29 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-	// 唯一的写端点：取消 run（其余全部为只读 GET）
-	if r.Method == http.MethodPost && strings.HasSuffix(path, "/cancel") &&
-		strings.HasPrefix(path, "/api/v1/runs/") {
-		h.cancelRun(w, r, strings.TrimSuffix(strings.TrimPrefix(path, "/api/v1/runs/"), "/cancel"))
+	// 写端点：取消/重跑 run、暂停/恢复函数（其余全部为只读 GET）
+	if r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/runs/") {
+		id := strings.TrimPrefix(path, "/api/v1/runs/")
+		switch {
+		case strings.HasSuffix(id, "/cancel"):
+			h.cancelRun(w, r, strings.TrimSuffix(id, "/cancel"))
+		case strings.HasSuffix(id, "/replay"):
+			h.replayRun(w, r, strings.TrimSuffix(id, "/replay"))
+		default:
+			writeErr(w, http.StatusNotFound, "not found")
+		}
+		return
+	}
+	if r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/functions/") {
+		id := strings.TrimPrefix(path, "/api/v1/functions/")
+		switch {
+		case strings.HasSuffix(id, "/pause"):
+			h.setFunctionPaused(w, r, strings.TrimSuffix(id, "/pause"), true)
+		case strings.HasSuffix(id, "/resume"):
+			h.setFunctionPaused(w, r, strings.TrimSuffix(id, "/resume"), false)
+		default:
+			writeErr(w, http.StatusNotFound, "not found")
+		}
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -140,6 +162,7 @@ type functionDTO struct {
 	ID       string   `json:"id"`
 	Event    string   `json:"event"`
 	AppURL   string   `json:"app_url"`
+	Paused   bool     `json:"paused"`
 	Stats24h statsDTO `json:"stats_24h"`
 }
 
@@ -276,10 +299,75 @@ func (h *Handler) cancelRun(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, map[string]any{"run": toRunDTO(run)})
 }
 
+// replayRun 处理 POST /api/v1/runs/{id}/replay（FR-6.2）：以原 run 的触发事件快照
+// （event_id/name/data/ts）创建全新 run（新随机 ID，不经事件路由，不继承 step memo）
+// 并以 at=now 入队。任何状态的 run（含 Failed/Completed/Cancelled）都可重跑。
+func (h *Handler) replayRun(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "run id required")
+		return
+	}
+	run, err := h.st.GetRun(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErr(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "get run")
+		return
+	}
+	newID := ids.NewID("run")
+	created, err := h.st.CreateRun(r.Context(), store.Run{
+		ID:         newID,
+		FunctionID: run.FunctionID,
+		Status:     store.RunQueued,
+		EventID:    run.EventID,
+		EventName:  run.EventName,
+		EventData:  run.EventData,
+		EventTS:    run.EventTS,
+	})
+	if err != nil || !created {
+		writeErr(w, http.StatusInternalServerError, "create replay run")
+		return
+	}
+	if err := h.st.Enqueue(r.Context(), store.QueueItem{
+		ID:         ids.NewID("qi"),
+		FunctionID: run.FunctionID,
+		RunID:      newID,
+		Score:      time.Now().UnixNano(),
+		At:         time.Now(),
+		Status:     store.QueuePending,
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, "enqueue replay run")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run_id": newID})
+}
+
+// setFunctionPaused 处理 POST /api/v1/functions/{id}/pause 与 /resume（FR-7.3）：
+// 写入独立的 paused_functions 表（跨重启保留，且不随 functions 注册表覆盖丢失）。
+// 函数未注册也可暂停/恢复（幂等置位），统一返回 200 {}。
+func (h *Handler) setFunctionPaused(w http.ResponseWriter, r *http.Request, id string, paused bool) {
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "function id required")
+		return
+	}
+	if err := h.st.SetFunctionPaused(r.Context(), id, paused); err != nil {
+		writeErr(w, http.StatusInternalServerError, "set function paused")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
 func (h *Handler) listFunctions(w http.ResponseWriter, r *http.Request) {
 	stats, err := h.st.FunctionStats24h(r.Context(), time.Now().Add(-24*time.Hour))
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "function stats")
+		return
+	}
+	paused, err := h.st.PausedFunctionIDs(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "paused functions")
 		return
 	}
 	out := make([]functionDTO, 0)
@@ -287,7 +375,7 @@ func (h *Handler) listFunctions(w http.ResponseWriter, r *http.Request) {
 		for _, f := range h.reg.FunctionsOf(appURL) {
 			s := stats[f.ID]
 			out = append(out, functionDTO{
-				ID: f.ID, Event: f.Event, AppURL: appURL,
+				ID: f.ID, Event: f.Event, AppURL: appURL, Paused: paused[f.ID],
 				Stats24h: statsDTO{Total: s.Total, Completed: s.Completed, Failed: s.Failed},
 			})
 		}

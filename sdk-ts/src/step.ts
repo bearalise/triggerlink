@@ -102,9 +102,9 @@ export function createStepTool(ec: ExecCtx): StepTool {
 }
 
 /** 毫秒 → Go duration 字符串（协议要求 timeout 为 Go duration，如 1500 → "1.5s"）。 */
-function msToGoDuration(ms: number): string {
+export function msToGoDuration(ms: number, what = "step.waitForEvent"): string {
   if (!Number.isFinite(ms) || ms <= 0) {
-    throw new Error(`step.waitForEvent: invalid timeout ${ms}`);
+    throw new Error(`${what}: invalid timeout ${ms}`);
   }
   return `${ms / 1000}s`;
 }

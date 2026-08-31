@@ -38,6 +38,10 @@ type FunctionOpts struct {
 	Cron     string     // 标准 5 字段 cron（分 时 日 月 周），UTC
 	Retries  int        // 重试上限；0 = 平台默认（4）
 	CancelOn []CancelOn // 取消规则，随 manifest 上报（cancel_on）
+	// Timeout：run 级超时（FR-4.3），随 manifest 上报（timeout，Go duration 字符串）。
+	// run 从创建起超过该时长仍在 Queued/Running，平台置 Failed 并发 triggerlink/run.failed
+	// 事件——配置了 OnFailure 的函数会因此触发。0 = 不限时。
+	Timeout time.Duration
 	// OnFailure：run 进入 Failed 终态时的处理器（FR-2.11）。Serve 时注册隐式函数
 	// <id>/on-failure，订阅内部事件 triggerlink/run.failed（match 按 function_id 过滤），
 	// Input.Event.Data = {"run_id","function_id","error","event":{...触发事件...}}。

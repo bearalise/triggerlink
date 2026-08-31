@@ -4,7 +4,7 @@
 import type { Client } from "./client.js";
 import type { TriggerFunction, EventPayload } from "./function.js";
 import { ExecCtx, StepInterrupt, type Opcode, type StepState } from "./execx.js";
-import { createStepTool, errMessage } from "./step.js";
+import { createStepTool, errMessage, msToGoDuration } from "./step.js";
 import { verifySignature } from "./sign.js";
 
 export const sdkVersion = "triggerlink-ts/0.4.6";
@@ -64,6 +64,14 @@ export function serve(opts: ServeOptions) {
         retries: f.opts.retries,
         ...(f.opts.cancelOn?.length
           ? { cancel_on: f.opts.cancelOn.map((c) => ({ event: c.event, match: c.match })) }
+          : {}),
+        ...(f.opts.timeout
+          ? {
+              timeout:
+                typeof f.opts.timeout === "number"
+                  ? msToGoDuration(f.opts.timeout, "createFunction")
+                  : f.opts.timeout,
+            }
           : {}),
       })),
     });

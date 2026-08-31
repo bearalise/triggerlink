@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
-import { fetchRun, cancelRun } from '../api'
+import { useNavigate, useParams } from 'react-router-dom'
+import { fetchRun, cancelRun, replayRun } from '../api'
 import { usePolling } from '../usePolling'
 import StatusBadge from '../components/StatusBadge'
 import JsonTree from '../components/JsonTree'
@@ -124,9 +124,12 @@ function StepBar({ index, step, startMs, endMs, t0, range }) {
 
 export default function RunDetailPage() {
   const { id } = useParams()
+  const navigate = useNavigate()
   const [terminal, setTerminal] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [stopError, setStopError] = useState(null)
+  const [replaying, setReplaying] = useState(false)
+  const [replayError, setReplayError] = useState(null)
   useEffect(() => setTerminal(false), [id])
   const { data, offline } = usePolling(
     async () => {
@@ -161,22 +164,47 @@ export default function RunDetailPage() {
     }
   }
 
+  // Replay：用原 run 的触发事件快照创建一个全新 run 从头执行（不继承 step memo），成功后跳转到新 run
+  const onReplay = async () => {
+    setReplaying(true)
+    setReplayError(null)
+    try {
+      const { run_id } = await replayRun(run.id)
+      navigate(`/runs/${run_id}`)
+    } catch (e) {
+      setReplayError(e.message)
+      setReplaying(false)
+    }
+  }
+
   return (
     <div className="space-y-4">
       {offline && <div className={bannerCls}>Connection lost, retrying…</div>}
       {stopError && <div className={bannerCls}>Stop failed: {stopError}</div>}
+      {replayError && <div className={bannerCls}>Replay failed: {replayError}</div>}
       <div className="flex items-center gap-3">
         <h1 className="text-lg font-semibold font-mono text-white">{run.id}</h1>
         <StatusBadge status={run.status} />
-        {ACTIVE.has(run.status) && (
-          <button
-            onClick={onStop}
-            disabled={stopping}
-            className="ml-auto rounded-md border border-red-800 bg-red-500/10 px-3 py-1 text-sm text-red-400 hover:bg-red-500/20 disabled:opacity-50"
-          >
-            {stopping ? 'Stopping…' : 'Stop run'}
-          </button>
-        )}
+        <div className="ml-auto flex items-center gap-2">
+          {ACTIVE.has(run.status) && (
+            <button
+              onClick={onStop}
+              disabled={stopping}
+              className="rounded-md border border-red-800 bg-red-500/10 px-3 py-1 text-sm text-red-400 hover:bg-red-500/20 disabled:opacity-50"
+            >
+              {stopping ? 'Stopping…' : 'Stop run'}
+            </button>
+          )}
+          {terminal && (
+            <button
+              onClick={onReplay}
+              disabled={replaying}
+              className="rounded-md border border-blue-800 bg-blue-500/10 px-3 py-1 text-sm text-blue-400 hover:bg-blue-500/20 disabled:opacity-50"
+            >
+              {replaying ? 'Replaying…' : 'Replay'}
+            </button>
+          )}
+        </div>
       </div>
       <div className="text-sm text-neutral-400 space-x-4">
         <span>Function <span className="font-mono text-neutral-200">{run.function_id}</span></span>

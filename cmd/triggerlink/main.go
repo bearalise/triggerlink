@@ -96,7 +96,7 @@ func main() {
 				b, _ := json.Marshal(f.CancelOn)
 				cancelOn = string(b)
 			}
-			rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Match: f.Match, Cron: f.Cron, Retries: f.Retries, CancelOn: cancelOn})
+			rfns = append(rfns, store.RegisteredFunction{ID: f.ID, AppURL: appURL, Event: f.Event, Match: f.Match, Cron: f.Cron, Retries: f.Retries, CancelOn: cancelOn, Timeout: f.Timeout})
 		}
 		return st.ReplaceAppFunctions(ctx, appURL, rfns)
 	}
@@ -112,7 +112,7 @@ func main() {
 				}
 			}
 			byApp[rf.AppURL] = append(byApp[rf.AppURL],
-				registry.Function{ID: rf.ID, Event: rf.Event, Match: rf.Match, Cron: rf.Cron, Retries: rf.Retries, CancelOn: cancelOn, AppURL: rf.AppURL})
+				registry.Function{ID: rf.ID, Event: rf.Event, Match: rf.Match, Cron: rf.Cron, Retries: rf.Retries, CancelOn: cancelOn, Timeout: rf.Timeout, AppURL: rf.AppURL})
 		}
 		for appURL, fns := range byApp {
 			reg.Sync(appURL, fns)

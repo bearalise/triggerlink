@@ -185,6 +185,39 @@ func TestManifestMatchCron(t *testing.T) {
 	}
 }
 
+func TestManifestTimeout(t *testing.T) {
+	fn := CreateFunction(FunctionOpts{
+		ID: "slow-etl", Event: "etl/start", Timeout: 5 * time.Minute,
+	}, func(ctx context.Context, in Input) (any, error) { return nil, nil })
+	plain := CreateFunction(FunctionOpts{ID: "plain", Event: "x/y"},
+		func(ctx context.Context, in Input) (any, error) { return nil, nil })
+	h := Serve(testClient(), fn, plain)
+	req := httptest.NewRequest(http.MethodGet, "/api/triggerlink", nil)
+	req.Header.Set("X-TriggerLink-Signature", signHeader("k", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	body := rec.Body.Bytes()
+
+	var m struct {
+		Functions []struct {
+			ID      string `json:"id"`
+			Timeout string `json:"timeout"`
+		} `json:"functions"`
+	}
+	json.Unmarshal(body, &m)
+	byID := map[string]string{}
+	for _, f := range m.Functions {
+		byID[f.ID] = f.Timeout
+	}
+	if byID["slow-etl"] != "5m0s" {
+		t.Fatalf("manifest=%s", body)
+	}
+	// 未配置时按 omitempty 省略
+	if byID["plain"] != "" || strings.Contains(string(body), `"id":"plain","event":"x/y","timeout"`) {
+		t.Fatalf("plain fn should omit timeout: %s", body)
+	}
+}
+
 func TestOnFailureImplicitFunction(t *testing.T) {
 	fn := CreateFunction(FunctionOpts{
 		ID: "process-doc", Event: "doc/uploaded",

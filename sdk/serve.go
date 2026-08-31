@@ -69,13 +69,18 @@ func (h *serveHandler) handleManifest(w http.ResponseWriter, r *http.Request) {
 		Cron     string     `json:"cron,omitempty"`
 		Retries  int        `json:"retries"`
 		CancelOn []CancelOn `json:"cancel_on,omitempty"`
+		Timeout  string     `json:"timeout,omitempty"`
 	}
 	fns := make([]fnInfo, 0, len(h.byID))
 	for _, f := range h.byID {
-		fns = append(fns, fnInfo{
+		info := fnInfo{
 			ID: f.opts.ID, Event: f.opts.Event, Match: f.opts.Match, Cron: f.opts.Cron,
 			Retries: f.opts.Retries, CancelOn: f.opts.CancelOn,
-		})
+		}
+		if f.opts.Timeout > 0 {
+			info.Timeout = f.opts.Timeout.String()
+		}
+		fns = append(fns, info)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

@@ -127,6 +127,8 @@ The platform ships with a built-in Dashboard at `http://localhost:8288/dashboard
 - Four pages: **Run list** (filter by function/status), **Run detail** (step timeline with each step's output/error/retry count), **Event stream** (payloads with backlinks to the runs they triggered), **Function list** (24h success rate).
 - Data refreshes automatically (2–5s polling); the detail page stops polling once a run reaches a terminal state.
 - **Cancelling a run**: the run detail page shows a **Stop run** button while the run is Queued/Running (e.g. stuck retrying against a failing app). Cancelling marks the run `Cancelled` (a terminal state), drops its pending queue items, and discards any in-flight callback result — no further retries or steps will execute.
+- **Replaying a run**: the run detail page shows a **Replay** button once the run reaches a terminal state. Replaying creates a brand-new run from the original run's triggering-event snapshot and executes it from scratch — no step memos are inherited (completed steps of the original run will run again). The page jumps to the new run's detail automatically.
+- **Pausing a function**: each row on the function list page has a **Pause/Resume** button and a `paused` badge. Pausing stops the function from accepting new triggers; in-flight runs continue to completion. Resume re-enables triggering.
 
 The corresponding admin API (also protected by basic auth, usable from scripts):
 
@@ -135,8 +137,13 @@ curl -u user:password localhost:8288/api/v1/runs?status=running
 curl -u user:password localhost:8288/api/v1/runs/<run_id>
 curl -u user:password localhost:8288/api/v1/events
 curl -u user:password localhost:8288/api/v1/functions
-# The single write endpoint: cancel a non-terminal run (409 if already terminal)
+# Cancel a non-terminal run (409 if already terminal)
 curl -u user:password -X POST localhost:8288/api/v1/runs/<run_id>/cancel
+# Replay a run from scratch: 200 {"run_id": "<new run id>"}; 404 if no such run
+curl -u user:password -X POST localhost:8288/api/v1/runs/<run_id>/replay
+# Pause / resume a function's triggering (in-flight runs are unaffected)
+curl -u user:password -X POST localhost:8288/api/v1/functions/<function_id>/pause
+curl -u user:password -X POST localhost:8288/api/v1/functions/<function_id>/resume
 ```
 
 ## 5. Integrating into Your Application (Application Side)
@@ -353,6 +360,25 @@ const fn = createFunction(
 
 The implicit function's own failure does **not** recursively trigger another failure handler (no re-entry).
 
+### 5.3.7 Timeout (Run-Level Timeout)
+
+`Timeout` in `FunctionOpts` caps how long a single run may stay alive, counted from run creation: if the run is still Queued/Running when the timeout elapses, the platform marks it `Failed` and emits the internal `triggerlink/run.failed` event — so a function with an `OnFailure` handler will have it fire on timeout (FR-4.3). The default (0 / unset) is no time limit. This is a run-level cap, distinct from the per-callback HTTP timeout (a single step's execution must return within 5 minutes):
+
+```go
+fn := triggerlink.CreateFunction(
+    triggerlink.FunctionOpts{
+        ID: "slow-etl", Event: "etl/start",
+        Timeout: 30 * time.Minute, // any run alive longer than 30m is failed
+    },
+    handler,
+)
+```
+
+```ts
+// timeout accepts a Go duration string ("30m") or a millisecond number
+const fn = createFunction({ id: "slow-etl", event: "etl/start", timeout: "30m" }, handler);
+```
+
 ### 5.4 Error Handling Semantics
 
 - A step returning an error → the platform records a failure memo and retries with backoff (starting at 1s, exponential, capped at 30s); after **4 total attempts by default** the run is marked Failed.
@@ -533,6 +559,8 @@ On "self-registration" in step 1: it is purely a local-development convenience (
     "SELECT id, function_id, status, attempt, error FROM runs ORDER BY created_at DESC LIMIT 10;"
   sqlite3 triggerlink.db "SELECT * FROM step_runs WHERE run_id='<run_id>';"
   ```
+- **Re-running a failed run**: use the Dashboard's **Replay** button on the run detail page, or `POST /api/v1/runs/<run_id>/replay`. This starts a fresh run from the original triggering event with no step memos carried over — every step re-executes, so only replay functions whose steps are safe to re-run (or whose side effects are idempotent).
+- **Stopping new work during an incident**: pause the affected function (Dashboard function list, or `POST /api/v1/functions/<function_id>/pause`) to stop accepting new triggers while in-flight runs finish; resume with `POST /api/v1/functions/<function_id>/resume` once the downstream issue is resolved.
 - **Security**: `-event-key` protects the event ingress; `-signing-key` protects both directions of the platform↔application link (callback signing + introspection signing). Both keys should come from environment variables / a secrets manager — never hardcode them.
 
 ## 9. M0 Boundaries (Planned Capabilities)

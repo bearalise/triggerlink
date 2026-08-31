@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"sync"
@@ -24,14 +25,40 @@ type CancelRule struct {
 // Function 是一个已注册的 durable 函数的路由条目。
 // Match 是事件触发的过滤表达式（FR-3.1，expr-lang，环境只含 data）：非空且不命中则不为该函数建 run。
 // Cron 是标准 5 字段 cron 表达式（FR-3.2，UTC，分钟粒度）：非空时由 scheduler 定时触发，不经事件路由。
+// Timeout 是 run 级超时（FR-4.3）：run 从 created_at 起超过该时长仍在 Queued/Running 则置 Failed；0 表示不限制。
+// 清单 JSON 中 timeout 为 Go duration 字符串（如 "5m"），故不参与默认 JSON 解码（见 UnmarshalJSON）。
 type Function struct {
-	ID       string       `json:"id"`
-	Event    string       `json:"event"`
-	Match    string       `json:"match,omitempty"`
-	Cron     string       `json:"cron,omitempty"`
-	Retries  int          `json:"retries"`
-	CancelOn []CancelRule `json:"cancel_on,omitempty"`
-	AppURL   string       `json:"-"`
+	ID       string        `json:"id"`
+	Event    string        `json:"event"`
+	Match    string        `json:"match,omitempty"`
+	Cron     string        `json:"cron,omitempty"`
+	Retries  int           `json:"retries"`
+	CancelOn []CancelRule  `json:"cancel_on,omitempty"`
+	Timeout  time.Duration `json:"-"`
+	AppURL   string        `json:"-"`
+}
+
+// UnmarshalJSON 解析清单 JSON 的 timeout 字段（Go duration 字符串，如 "5m"）；
+// 非法值记日志并视为 0（不限制），不使整个内省失败。
+func (f *Function) UnmarshalJSON(b []byte) error {
+	type alias Function // 避免递归调用 UnmarshalJSON
+	var raw struct {
+		alias
+		Timeout string `json:"timeout"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*f = Function(raw.alias)
+	if raw.Timeout != "" {
+		d, err := time.ParseDuration(raw.Timeout)
+		if err != nil {
+			log.Printf("registry: function %s invalid timeout %q, treated as unlimited: %v", raw.ID, raw.Timeout, err)
+		} else {
+			f.Timeout = d
+		}
+	}
+	return nil
 }
 
 type manifest struct {
@@ -109,6 +136,17 @@ func (r *Registry) CronFunctions() []Function {
 		if f.Cron != "" {
 			out = append(out, f)
 		}
+	}
+	return out
+}
+
+// All 返回注册表中的全部函数（无序），executor 的 run 超时扫描（FR-4.3）枚举用。
+func (r *Registry) All() []Function {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]Function, 0, len(r.byID))
+	for _, f := range r.byID {
+		out = append(out, f)
 	}
 	return out
 }

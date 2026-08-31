@@ -29,5 +29,5 @@ export function usePolling(fn, intervalMs, deps = [], active = true) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, intervalMs, tick, ...deps])
 
-  return { data, error, offline }
+  return { data, error, offline, refresh: tick }
 }

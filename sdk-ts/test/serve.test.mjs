@@ -285,6 +285,19 @@ test("GET manifest：match/cron 序列化，未配置则不出现", async () => 
   assert.ok(!("match" in plainFn) && !("cron" in plainFn));
 });
 
+test("GET manifest：timeout 序列化为 Go duration（字符串透传，毫秒转换），未配置则不出现", async () => {
+  const fnStr = createFunction({ id: "slow-etl", event: "etl/start", timeout: "5m" }, async () => ({}));
+  const fnMs = createFunction({ id: "slow-report", event: "report/generate", timeout: 90_000 }, async () => ({}));
+  const plain = createFunction({ id: "plain", event: "x/y" }, async () => ({}));
+  const { GET } = serve({ client, functions: [fnStr, fnMs, plain] });
+
+  const manifest = await (await GET(new Request("http://localhost/api/triggerlink", { headers: signedHeaders() }))).json();
+  assert.equal(manifest.functions.find((f) => f.id === "slow-etl").timeout, "5m");
+  assert.equal(manifest.functions.find((f) => f.id === "slow-report").timeout, "90s"); // 90000ms → "90s"
+  const plainFn = manifest.functions.find((f) => f.id === "plain");
+  assert.ok(!("timeout" in plainFn));
+});
+
 test("createFunction：纯 cron 函数可省略 event；event/cron 都缺则抛错", async () => {
   const cronOnly = createFunction({ id: "nightly", cron: "0 9 * * *" }, async () => ({}));
   const { GET } = serve({ client, functions: [cronOnly] });
