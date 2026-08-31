@@ -15,7 +15,7 @@ import (
 )
 
 // newTestStack 组装真实 SQLite + handler + 有缓冲 stream。
-func newTestStack(t *testing.T) (*Handler, *store.SQLiteStore, chan store.Event) {
+func newTestStack(t *testing.T) (*Handler, *store.SQLStore, chan store.Event) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -27,7 +27,7 @@ func newTestStack(t *testing.T) (*Handler, *store.SQLiteStore, chan store.Event)
 }
 
 // seedWebhook 落库一个 webhook 并返回其 secret。
-func seedWebhook(t *testing.T, st *store.SQLiteStore, id, eventName, secret string) {
+func seedWebhook(t *testing.T, st *store.SQLStore, id, eventName, secret string) {
 	t.Helper()
 	if err := st.CreateWebhook(context.Background(), store.Webhook{
 		ID: id, EventName: eventName, Secret: secret, CreatedAt: time.Now(),
