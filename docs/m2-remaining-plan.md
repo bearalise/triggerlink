@@ -3,12 +3,20 @@
 > 目标：完成 PRD 第 6 章 M2 剩余功能——流控（debounce/throttle/batching）、可观测性（slog/metrics/保留策略）、Postgres 存储后端。
 > 依据：`docs/triggerlink-prd.md` FR-4.4/4.5/4.7、FR-6.3/6.4/6.6、第 7 章存储设计。
 > 现状基线：main @ c47d257 之后。SQLite 单后端；`store.Store` 接口约 40 个方法（`internal/store/store.go:122`）；执行器并发控制为内存 `inFlight` map（`internal/executor/executor.go:51`）；队列 = `queue_items` 表 + `UPDATE...RETURNING` 原子租赁；manifest 已有字段 id/event/match/cron/retries/cancel_on/timeout。
-> 执行顺序：**阶段 B（可观测性）→ 阶段 A（流控）→ 阶段 C（Postgres）**。B 独立且是压测/发布门禁的前提；A 动队列调度核心，放在观测能力就绪后便于验证；C 工作量最大且依赖 A/B 的 Store 接口最终形态。
+> 执行顺序：**阶段 B（可观测性，已完成）→ 阶段 A（流控）→ 阶段 C（Postgres）**。B 独立且是压测/发布门禁的前提；A 动队列调度核心，放在观测能力就绪后便于验证；C 工作量最大且依赖 A/B 的 Store 接口最终形态。
 > 每个阶段独立成 PR：开分支 → 实现 → 全量测试（含 e2e）→ 推送开 PR → 合并。SDK 有面向用户改动时发 npm patch/minor。
 
 ---
 
-## 阶段 B：可观测性（FR-6.3 / FR-6.4 / FR-6.6）
+## 阶段 B：可观测性（FR-6.3 / FR-6.4 / FR-6.6）✅ 已完成
+
+分支 `feat/observability`，三个 commit（B1 slog / B2 metrics / B3 janitor）。与计划的差异：
+
+- B2 的 `events_routed_total` 增加 `result="filtered"`（触发 match 不命中）：否则事件在路由层静默消失，无法排障。
+- B2 的 `step_duration_seconds` 口径按 op 区分：`Run`/`SendEvent` = 回调内同步执行时长，`Sleep` = 目标时长，`WaitForEvent` = 挂起到解除的墙钟（`waits.created_at` 起算）。step_runs 表无时间戳，未为此加列。
+- B3 的 queue_items 清理确认无需做：`CompleteQueueItem` 是 DELETE，残留租约由 `RequeueExpiredLeases` 对账。
+- B3 的 `-retention-days` 语义：默认 30，flag=0 时读 env，小于 1 天拒绝启动，负数显式关闭清理。
+- 依赖锁在 `prometheus/client_golang v1.22.0`：更高版本会把 go 指令顶到 1.24+，与 CI 的 1.23 冲突。
 
 预估 1–1.5 天。全部为服务端改动，无协议变更，SDK 不动。
 
