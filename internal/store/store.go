@@ -243,7 +243,9 @@ type SQLStore struct {
 // Backend 返回底层后端名（"sqlite" / "postgres"），供日志与诊断使用。
 func (s *SQLStore) Backend() string { return s.d.name() }
 
-func fmtTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+// fmtTime 用定宽格式（纳秒恒为 9 位）存时间，保证 SQLite 里字符串序与时间序一致；
+// RFC3339Nano 会裁掉尾零导致变宽，字符串比较会错序。
+func fmtTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000000000Z07:00") }
 
 func parseTime(s string) (time.Time, error) { return time.Parse(time.RFC3339Nano, s) }
 

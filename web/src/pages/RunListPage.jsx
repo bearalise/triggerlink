@@ -26,7 +26,7 @@ export default function RunListPage() {
   const loadMore = async () => {
     const last = runs[runs.length - 1]
     if (!last) return
-    const d = await fetchRuns({ ...params, before: last.id })
+    const d = await fetchRuns({ ...params, before: `${last.created_at}|${last.id}` })
     setExtra((prev) => [...prev, ...d.runs])
   }
 

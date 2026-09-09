@@ -8,7 +8,9 @@ import (
 	"time"
 )
 
-// ListRunsOptions 是 ListRuns 的过滤条件；空值表示不过滤。Before 为游标（取 id 更早的记录）。
+// ListRunsOptions 是 ListRuns 的过滤条件；空值表示不过滤。
+// Before 为复合游标 "<created_at>|<id>"（取该位置之前的记录），因事件路由的 run
+// ID 是 (event_id, function_id) 的哈希（derivedRunID），不含时间序，无法用 id 翻页。
 type ListRunsOptions struct {
 	FunctionID string
 	Status     string
@@ -24,14 +26,36 @@ func clampLimit(n int) int {
 	return n
 }
 
-// ListRuns 按 id（时间序）倒序返回 run 摘要；不填充 EventData/Output（列表页不需要大 payload）。
+// splitRunCursor 解析 Before 复合游标 "<created_at>|<id>"；时间部分归一化为存储格式
+// （调用方传入的可能是 JSON 序列化的变宽 RFC3339Nano），使字符串比较与时间序一致。
+// 非法游标返回 ok=false，调用方按无游标处理。
+func splitRunCursor(before string) (ts time.Time, id string, ok bool) {
+	i := strings.LastIndex(before, "|")
+	if i <= 0 || i == len(before)-1 {
+		return time.Time{}, "", false
+	}
+	t, err := parseTime(before[:i])
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return t, before[i+1:], true
+}
+
+// ListRuns 按 created_at（创建时间）倒序返回 run 摘要，id 作同刻 tiebreaker；
+// 不填充 EventData/Output（列表页不需要大 payload）。
 func (s *SQLStore) ListRuns(ctx context.Context, o ListRunsOptions) ([]Run, error) {
+	var cursor, cursorTS, cursorID string
+	if ts, id, ok := splitRunCursor(o.Before); ok {
+		cursor, cursorTS, cursorID = o.Before, fmtTime(ts), id
+	}
 	rows, err := s.query(ctx,
 		`SELECT id, function_id, status, event_id, event_name, attempt, created_at, ended_at
 		 FROM runs
-		 WHERE (?='' OR function_id=?) AND (?='' OR status=?) AND (?='' OR event_id=?) AND (?='' OR id<?)
-		 ORDER BY id DESC LIMIT ?`,
-		o.FunctionID, o.FunctionID, o.Status, o.Status, o.EventID, o.EventID, o.Before, o.Before, clampLimit(o.Limit))
+		 WHERE (?='' OR function_id=?) AND (?='' OR status=?) AND (?='' OR event_id=?)
+		   AND (?='' OR created_at<? OR (created_at=? AND id<?))
+		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		o.FunctionID, o.FunctionID, o.Status, o.Status, o.EventID, o.EventID,
+		cursor, cursorTS, cursorTS, cursorID, clampLimit(o.Limit))
 	if err != nil {
 		return nil, err
 	}

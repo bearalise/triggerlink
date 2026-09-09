@@ -57,7 +57,7 @@ func TestListRunsFiltersAndCursor(t *testing.T) {
 	if len(byStatus) != 1 || byStatus[0].ID != NewTestID("run", 2) {
 		t.Fatalf("byStatus: %+v", byStatus)
 	}
-	page, _ := st.ListRuns(ctx, ListRunsOptions{Before: NewTestID("run", 3)})
+	page, _ := st.ListRuns(ctx, ListRunsOptions{Before: all[0].CreatedAt.Format(time.RFC3339Nano) + "|" + all[0].ID})
 	if len(page) != 2 || page[0].ID != NewTestID("run", 2) {
 		t.Fatalf("cursor: %+v", page)
 	}
@@ -68,6 +68,31 @@ func TestListRunsFiltersAndCursor(t *testing.T) {
 	byEvent, _ := st.ListRuns(ctx, ListRunsOptions{EventID: "evt_1"})
 	if len(byEvent) != 2 {
 		t.Fatalf("byEvent: %d", len(byEvent))
+	}
+}
+
+// 回归：事件路由的 run ID 是哈希（derivedRunID），与时间序无关，
+// 列表必须按 created_at 倒序而不是按 id 倒序。
+func TestListRunsOrdersByCreatedAtNotID(t *testing.T) {
+	st := openTemp(t)
+	ctx := context.Background()
+	seedRunRec(t, st, "run_zzzzzzzzzzzzzzzzzzzzzzzz", "fn-a", RunQueued, "evt_1")
+	time.Sleep(time.Millisecond) // 保证 created_at 可区分（PG 精度到微秒）
+	seedRunRec(t, st, "run_aaaaaaaaaaaaaaaaaaaaaaaa", "fn-a", RunQueued, "evt_2")
+
+	all, err := st.ListRuns(ctx, ListRunsOptions{})
+	if err != nil || len(all) != 2 {
+		t.Fatalf("all: %+v err=%v", all, err)
+	}
+	if all[0].ID != "run_aaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("newest first by created_at, got %s", all[0].ID)
+	}
+	// 游标翻页：用第一页最后一行的 (created_at, id) 取更早的记录。
+	page, err := st.ListRuns(ctx, ListRunsOptions{
+		Before: all[0].CreatedAt.Format(time.RFC3339Nano) + "|" + all[0].ID,
+	})
+	if err != nil || len(page) != 1 || page[0].ID != "run_zzzzzzzzzzzzzzzzzzzzzzzz" {
+		t.Fatalf("cursor page: %+v err=%v", page, err)
 	}
 }
 
