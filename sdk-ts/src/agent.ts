@@ -99,6 +99,8 @@ export interface AgentOpts {
   tools?: Record<string, AgentTool<any, any>>;
   /** 迭代上限（一次迭代 = 一次 LLM 调用 + 其全部工具执行），默认 10；超限抛错使 run 失败 */
   maxIterations?: number;
+  /** 每次 LLM 调用的最大输出 token 数，透传给 generateText；不设则由模型/provider 决定 */
+  maxOutputTokens?: number;
   redact?: RedactHook;
   lifecycle?: AgentLifecycle;
 }
@@ -194,6 +196,12 @@ export function createAgent(opts: AgentOpts): Agent {
   if (!Number.isInteger(maxIterations) || maxIterations < 1) {
     throw new Error("createAgent: maxIterations must be a positive integer");
   }
+  if (opts.maxOutputTokens !== undefined) {
+    if (!Number.isInteger(opts.maxOutputTokens) || opts.maxOutputTokens < 1) {
+      throw new Error("createAgent: maxOutputTokens must be a positive integer");
+    }
+  }
+  const maxOutputTokens = opts.maxOutputTokens;
 
   const toolDefs = opts.tools ?? {};
   // 以 schema-only 方式把工具交给 AI SDK（不传 execute）：
@@ -237,6 +245,7 @@ export function createAgent(opts: AgentOpts): Agent {
             system: opts.system,
             messages,
             tools: aiTools,
+            maxOutputTokens,
           });
           const memo: LlmMemo = {
             text: res.text,
