@@ -89,6 +89,7 @@ interface AgentOpts {
   system?: string;
   tools?: Record<string, AgentTool>;
   maxIterations?: number;              // default 10; throws (RunError) when exceeded
+  maxOutputTokens?: number;            // per-LLM-call output token cap, passed through to generateText
   redact?: RedactHook;                 // opt-in; transforms step output before persistence (see §5.7)
   lifecycle?: {
     // fired once per *actual* LLM call, inside the llm step (after redact+validate):

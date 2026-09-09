@@ -92,3 +92,18 @@ func TestFlowControlMarshalRoundTrip(t *testing.T) {
 		t.Fatalf("invalid stored config must yield nil, got %+v", got)
 	}
 }
+
+// -db 是 Postgres 连接串时，日志里必须抹掉口令。
+func TestRedactDBURI(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"triggerlink.db", "triggerlink.db"},
+		{"/var/lib/triggerlink/tl.db", "/var/lib/triggerlink/tl.db"},
+		{"postgres://user:s3cret@db:5432/tl?sslmode=disable", "postgres://user:***@db:5432/tl?sslmode=disable"},
+		{"postgres://user@db:5432/tl", "postgres://user@db:5432/tl"},
+		{"postgresql://db:5432/tl", "postgresql://db:5432/tl"},
+	} {
+		if got := redactDBURI(c.in); got != c.want {
+			t.Fatalf("redactDBURI(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

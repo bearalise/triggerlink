@@ -123,6 +123,7 @@ const researcher = createAgent({
   system: "You are a research assistant. Answer concisely.",
   tools: { search: searchKb },
   maxIterations: 10,                     // safety cap; the run fails when exceeded
+  maxOutputTokens: 1024,                 // per-LLM-call output token cap (optional)
 });
 
 const answerQuestion = createFunction(

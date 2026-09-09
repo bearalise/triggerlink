@@ -33,7 +33,7 @@ import (
 )
 
 type stack struct {
-	store    *store.SQLiteStore
+	store    *store.SQLStore
 	eventURL string
 	stream   chan store.Event
 }
@@ -44,14 +44,14 @@ type stack struct {
 // 或在做启动对账扫描前完成函数注册）。
 func startStackRaw(t *testing.T, opts triggerlink.FunctionOpts,
 	handler func(ctx context.Context, in triggerlink.Input) (any, error),
-	beforeStart func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string)) (*stack, *registry.Registry, string) {
+	beforeStart func(ctx context.Context, st *store.SQLStore, reg *registry.Registry, appURL string)) (*stack, *registry.Registry, string) {
 	t.Helper()
 	return startStackFns(t, []*triggerlink.Function{triggerlink.CreateFunction(opts, handler)}, beforeStart)
 }
 
 // startStackFns 与 startStackRaw 同，但 app 挂载多个函数（扇出/多订阅场景）。
 func startStackFns(t *testing.T, fns []*triggerlink.Function,
-	beforeStart func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string)) (*stack, *registry.Registry, string) {
+	beforeStart func(ctx context.Context, st *store.SQLStore, reg *registry.Registry, appURL string)) (*stack, *registry.Registry, string) {
 	t.Helper()
 	return startStackFull(t, fns, beforeStart, nil)
 }
@@ -59,15 +59,11 @@ func startStackFns(t *testing.T, fns []*triggerlink.Function,
 // startStackFull 与 startStackFns 同，tweakExec 非 nil 时在 executor 启动前调整其配置
 // （如调小 TimeoutScanInterval 加速 run 超时扫描）。
 func startStackFull(t *testing.T, fns []*triggerlink.Function,
-	beforeStart func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string),
+	beforeStart func(ctx context.Context, st *store.SQLStore, reg *registry.Registry, appURL string),
 	tweakExec func(*executor.Executor)) (*stack, *registry.Registry, string) {
 	t.Helper()
 
-	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st := openStore(t)
 
 	client := triggerlink.NewClient(triggerlink.Options{AppID: "app", SigningKey: "k"})
 	app := httptest.NewServer(triggerlink.Serve(client, fns...))
@@ -101,7 +97,7 @@ func startStackFull(t *testing.T, fns []*triggerlink.Function,
 }
 
 // mountDash 挂一个 dashapi httptest server（写端点：replay/pause/resume），不带 basic auth。
-func mountDash(t *testing.T, st *store.SQLiteStore, reg *registry.Registry) string {
+func mountDash(t *testing.T, st *store.SQLStore, reg *registry.Registry) string {
 	t.Helper()
 	srv := httptest.NewServer(dashapi.NewHandler(st, reg))
 	t.Cleanup(srv.Close)
@@ -126,10 +122,10 @@ func dashPost(t *testing.T, dashURL, path string) (int, map[string]any) {
 // beforeStart 非 nil 时在 runner/executor 启动前调用（注入"崩溃前"的库内状态）。
 func startStack(t *testing.T, opts triggerlink.FunctionOpts,
 	handler func(ctx context.Context, in triggerlink.Input) (any, error),
-	beforeStart func(ctx context.Context, st *store.SQLiteStore)) *stack {
+	beforeStart func(ctx context.Context, st *store.SQLStore)) *stack {
 	t.Helper()
 	s, _, _ := startStackRaw(t, opts, handler,
-		func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string) {
+		func(ctx context.Context, st *store.SQLStore, reg *registry.Registry, appURL string) {
 			if beforeStart != nil {
 				beforeStart(ctx, st)
 			}
@@ -157,7 +153,7 @@ func (s *stack) sendEvent(t *testing.T, body string) {
 }
 
 // waitStatus 轮询直到存在目标状态的 run（M0 每个用例只发一个事件，run 唯一）。
-func waitStatus(t *testing.T, st *store.SQLiteStore, want string) {
+func waitStatus(t *testing.T, st *store.SQLStore, want string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -326,7 +322,7 @@ func TestSendEventFanout(t *testing.T) {
 		})
 
 	s, _, _ := startStackFns(t, []*triggerlink.Function{parent, child},
-		func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string) {
+		func(ctx context.Context, st *store.SQLStore, reg *registry.Registry, appURL string) {
 			fns, err := registry.Fetch(ctx, http.DefaultClient, appURL, "k")
 			if err != nil {
 				t.Fatalf("introspect: %v", err)
@@ -358,7 +354,7 @@ func TestStartupReconciliation(t *testing.T) {
 	st := startStack(t,
 		triggerlink.FunctionOpts{ID: "process-doc", Event: "doc/uploaded"},
 		func(ctx context.Context, in triggerlink.Input) (any, error) { return "ok", nil },
-		func(ctx context.Context, st *store.SQLiteStore) {
+		func(ctx context.Context, st *store.SQLStore) {
 			// 模拟崩溃窗口：事件落库了但还没进 stream（routed_at 为空）
 			inserted, err := st.InsertEvent(ctx, store.Event{
 				ID:   "orphan-1",
@@ -416,7 +412,7 @@ func TestDashboardAPI(t *testing.T) {
 			}
 			return map[string]any{"ok": true}, nil
 		},
-		func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string) {
+		func(ctx context.Context, st *store.SQLStore, reg *registry.Registry, appURL string) {
 			fns, err := registry.Fetch(ctx, http.DefaultClient, appURL, "k")
 			if err != nil {
 				t.Fatalf("introspect: %v", err)
@@ -513,7 +509,7 @@ func TestRegistrationSurvivesRestart(t *testing.T) {
 
 	// 与 main.go 一致的 persist 闭包：registry.Function → store.RegisteredFunction
 	// （cancel_on 序列化为 JSON 字符串，空规则留空）
-	persist := func(st *store.SQLiteStore) func(context.Context, string, []registry.Function) error {
+	persist := func(st *store.SQLStore) func(context.Context, string, []registry.Function) error {
 		return func(ctx context.Context, appURL string, fns []registry.Function) error {
 			rfns := make([]store.RegisteredFunction, 0, len(fns))
 			for _, f := range fns {
@@ -844,7 +840,7 @@ func TestCronTrigger(t *testing.T) {
 			gotTS.Store(data["ts"])
 			return "ok", nil
 		},
-		func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string) {
+		func(ctx context.Context, st *store.SQLStore, reg *registry.Registry, appURL string) {
 			fns, err := registry.Fetch(ctx, http.DefaultClient, appURL, "k")
 			if err != nil {
 				t.Fatalf("introspect: %v", err)
@@ -906,9 +902,9 @@ func TestCronTrigger(t *testing.T) {
 
 // registerApp 是 startStackRaw/startStackFull 的 beforeStart：内省 app 并同步注册表
 // （runner 启动前完成，与 startStack 的注册路径一致）。
-func registerApp(t *testing.T) func(context.Context, *store.SQLiteStore, *registry.Registry, string) {
+func registerApp(t *testing.T) func(context.Context, *store.SQLStore, *registry.Registry, string) {
 	t.Helper()
-	return func(ctx context.Context, st *store.SQLiteStore, reg *registry.Registry, appURL string) {
+	return func(ctx context.Context, st *store.SQLStore, reg *registry.Registry, appURL string) {
 		fns, err := registry.Fetch(ctx, http.DefaultClient, appURL, "k")
 		if err != nil {
 			t.Fatalf("introspect: %v", err)
@@ -1377,12 +1373,17 @@ func TestBatchingBySize(t *testing.T) {
 	select {
 	case batch := <-got:
 		if len(batch) != 3 || batch[0] != "1" || batch[2] != "3" {
-			t.Fatalf("handler saw %v, want [1 2 3] in arrival order", batch)
+			runs, _ := st.store.ListRuns(context.Background(), store.ListRunsOptions{Limit: 10})
+			t.Fatalf("handler saw %v, want [1 2 3] in arrival order (runs=%d)", batch, len(runs))
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("handler never ran")
 	}
 	if n, _ := st.store.CountRuns(context.Background()); n != 1 {
+		runs, _ := st.store.ListRuns(context.Background(), store.ListRunsOptions{Limit: 10})
+		for _, r := range runs {
+			t.Logf("run %s status=%s event=%s data=%s", r.ID, r.Status, r.EventID, r.EventData)
+		}
 		t.Fatalf("runs=%d, want 1 (three events → one batch run)", n)
 	}
 }

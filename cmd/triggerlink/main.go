@@ -78,7 +78,7 @@ func main() {
 	var retentionDays int
 	fs := flag.NewFlagSet("triggerlink "+cmd, flag.ExitOnError)
 	fs.StringVar(&addr, "addr", ":8288", "Event API 监听地址")
-	fs.StringVar(&dbPath, "db", "triggerlink.db", "SQLite 数据库路径")
+	fs.StringVar(&dbPath, "db", "triggerlink.db", "存储位置：SQLite 文件路径，或 postgres://... 连接串（一个 flag 两种后端）")
 	fs.StringVar(&eventKey, "event-key", "", "Event API 鉴权 key（start 必填，dev 缺省自动生成）")
 	fs.StringVar(&signingKey, "signing-key", "", "平台→应用回调签名密钥（start 必填，dev 缺省自动生成）")
 	fs.StringVar(&dashAuth, "dashboard-auth", "", "Dashboard basic auth 凭据 user:password（默认读 TRIGGERLINK_DASHBOARD_AUTH；都为空则生成随机密码打日志）")
@@ -115,7 +115,7 @@ func main() {
 
 	st, err := store.Open(dbPath)
 	if err != nil {
-		fatal("open store", "db", dbPath, "err", err)
+		fatal("open store", "db", redactDBURI(dbPath), "err", err)
 	}
 	defer st.Close()
 
@@ -243,8 +243,8 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("triggerlink listening", "version", version, "mode", cmd, "addr", addr, "db", dbPath,
-		"apps", len(apps), "retention", retention)
+	slog.Info("triggerlink listening", "version", version, "mode", cmd, "addr", addr,
+		"backend", st.Backend(), "apps", len(apps), "retention", retention)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		fatal("http server", "err", err)
 	}
@@ -298,6 +298,25 @@ func unmarshalFlowControl[T any](functionID, field, raw string) *T {
 		return nil
 	}
 	return &v
+}
+
+// redactDBURI 抹掉连接串里的口令再进日志——Postgres 的 -db 值形如
+// postgres://user:password@host/db，原样打印等于把口令写进日志文件。
+func redactDBURI(uri string) string {
+	i := strings.Index(uri, "://")
+	if i < 0 {
+		return uri // SQLite 文件路径，无凭据
+	}
+	rest := uri[i+3:]
+	at := strings.Index(rest, "@")
+	if at < 0 {
+		return uri
+	}
+	cred := rest[:at]
+	if c := strings.Index(cred, ":"); c >= 0 {
+		cred = cred[:c] + ":***"
+	}
+	return uri[:i+3] + cred + rest[at:]
 }
 
 // resolveRetention 解析保留期（FR-6.6）：flag 优先，env TRIGGERLINK_RETENTION_DAYS 兜底，

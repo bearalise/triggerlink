@@ -13,7 +13,7 @@ import (
 	"github.com/bearalise/triggerlink/internal/store"
 )
 
-func newTestHandler(t *testing.T) (*Handler, *store.SQLiteStore, *registry.Registry) {
+func newTestHandler(t *testing.T) (*Handler, *store.SQLStore, *registry.Registry) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -25,7 +25,7 @@ func newTestHandler(t *testing.T) (*Handler, *store.SQLiteStore, *registry.Regis
 }
 
 // seed 一条 completed run（含两个 step）与一个事件。
-func seed(t *testing.T, st *store.SQLiteStore, reg *registry.Registry) string {
+func seed(t *testing.T, st *store.SQLStore, reg *registry.Registry) string {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := st.InsertEvent(ctx, store.Event{

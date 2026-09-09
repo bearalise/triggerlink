@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func seedRun(t *testing.T, st *SQLiteStore) Run {
+func seedRun(t *testing.T, st *SQLStore) Run {
 	t.Helper()
 	r := Run{
 		ID:         "run_1",

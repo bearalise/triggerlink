@@ -11,14 +11,14 @@ M0 has only three kinds of deployment units (processes):
 ┌─────────────────┐        ┌──────────────────┐        ┌─────────────────┐
 │  App A (Go/TS)  │◄───────│  triggerlink     │◄───────│  Producer       │
 │  :8080          │ callback│ platform :8288  │ events │  (any system)   │
-└─────────────────┘        │  + SQLite file    │        └─────────────────┘
+└─────────────────┘        │  + SQLite or PG   │        └─────────────────┘
 ┌─────────────────┐        └──────────────────┘
 │  App B          │◄─────── Platform and apps only need HTTP
 └─────────────────┘        connectivity; they may run on the
                            same machine or on separate machines
 ```
 
-- **Platform**: a single process plus one SQLite file, with no other external dependencies. It can run on the same machine as the apps or be deployed independently.
+- **Platform**: a single process plus its store — a SQLite file (zero external dependencies) or a Postgres database (`-db postgres://...`, see "Storage Backend" below). It can run on the same machine as the apps or be deployed independently.
 - **Apps**: your business services (Go embedding `sdk`, or Next.js embedding `sdk-ts`), any number of them.
 - Network requirements: ① producers can reach the platform on `:8288`; ② **the platform can reach each app's serve endpoint** (callbacks + introspection).
 
@@ -91,6 +91,44 @@ TRIGGERLINK_SIGNING_KEY=<SIGNING_KEY> ./your-app &      # listens on :8080
 Seeing `level=INFO msg="registered function" function_id=<id> event=<name>` in the startup logs means registration succeeded; `level=WARN msg="introspect app"` means the corresponding app is not up or its signing key does not match.
 
 See the "Deploying the Platform" section of the [User Guide](user-guide.md) for a full description of all flags.
+
+### Storage Backend (SQLite or Postgres)
+
+`-db` takes either form — one flag, two backends:
+
+```bash
+./triggerlink start -db /var/lib/triggerlink/triggerlink.db          # SQLite (default)
+./triggerlink start -db "postgres://user:pass@db:5432/triggerlink?sslmode=disable"
+```
+
+Anything starting with `postgres://` or `postgresql://` is treated as a Postgres DSN; anything else is a SQLite file path. The schema is created on startup either way (`CREATE TABLE IF NOT EXISTS`), so pointing at an empty Postgres database is all the setup required — no migration tool, no manual DDL. The startup log line reports which backend is live (`backend=sqlite` / `backend=postgres`); credentials in the DSN are redacted from logs.
+
+Both backends run the **same query code** (`internal/store/dialect.go`); the dialect layer only rewrites placeholders and DDL, so semantics do not diverge — CI runs the whole store suite and the whole e2e suite against both.
+
+Which to choose:
+
+| | SQLite | Postgres |
+|---|---|---|
+| Setup | Nothing — one file | A database server |
+| Replicas | Single process only (single writer) | Same today (M2 is a single consumer); the groundwork for multi-replica |
+| Backup | `sqlite3 ... ".backup"` | `pg_dump` / your managed provider's snapshots |
+| Ops visibility | `sqlite3` CLI | Standard SQL tooling, existing monitoring |
+| Best for | Single machine, small-to-moderate volume | Existing Postgres infrastructure, shared ops practices, larger retention windows |
+
+Timestamps and JSON are stored as `TEXT` in both backends (UTC RFC3339Nano strings / raw JSON text) rather than `TIMESTAMPTZ`/`JSONB`. That keeps one query implementation for both engines; the cost is that hand-written reporting SQL on Postgres compares time as strings (the format sorts correctly) instead of using native date functions.
+
+**Rough throughput** (`go test ./internal/store/ -bench . -benchtime 300x`, Apple M-series laptop, Postgres 16 in local Docker — orders of magnitude, not a tuned benchmark):
+
+| Store operation | SQLite | Postgres | What it is on the hot path |
+|---|---|---|---|
+| `InsertEvent` | ~0.11 ms | ~1.4 ms | one write per accepted event (`POST /v1/events`) |
+| `CreateRun` + `Enqueue` | ~0.18 ms | ~2.8 ms | routing one event to one function = **two** writes |
+| `LeaseBatch` | ~0.23 ms | ~1.9 ms | one atomic dequeue per executor poll |
+| `SaveStepResult` | ~0.14 ms | ~1.4 ms | one write per completed step |
+
+Read this as shape, not as a ceiling. SQLite is in-process with WAL and `synchronous=NORMAL` (no fsync per commit); Postgres here pays a TCP round trip plus a durable commit per statement, over Docker Desktop's file system on macOS — a real Postgres server on local SSD closes much of that gap, and batching or a larger connection pool would change the picture again. The useful takeaway is the **write amplification**: one event that triggers one function costs 1 event write + 2 routing writes + 1 write per step, so a 5-step function is roughly 8 writes end to end.
+
+**Switching SQLite → Postgres**: there is no built-in data migration. Drain first — pause triggering functions (`POST /api/v1/functions/<id>/pause`), let in-flight runs converge, then restart with the new `-db`. History (past runs and events) stays behind in the old SQLite file; keep it around if you still need to read it.
 
 ### Logging
 
@@ -207,12 +245,16 @@ Notes for serverless (e.g. Vercel):
 
 ## 9. Data, Backup, and Upgrades
 
-- **Data**: all state lives in the SQLite file specified by `-db` (plus its `-wal`/`-shm` companion files).
-- **Backup**: use SQLite's online backup; do not directly `cp` a database file that is being written to:
+- **Data**: all state lives in the store named by `-db` — a SQLite file (plus its `-wal`/`-shm` companions) or a Postgres database.
+- **Backup (SQLite)**: use SQLite's online backup; do not directly `cp` a database file that is being written to:
   ```bash
   sqlite3 /var/lib/triggerlink/triggerlink.db ".backup /backup/triggerlink-$(date +%F).db"
   ```
-  The restart reconciliation mechanism guarantees that unfinished runs automatically resume after restoring from a backup.
+- **Backup (Postgres)**: `pg_dump` as usual, or rely on your managed provider's snapshots:
+  ```bash
+  pg_dump "postgres://user:pass@db:5432/triggerlink" -Fc -f /backup/triggerlink-$(date +%F).dump
+  ```
+  In both cases the restart reconciliation mechanism guarantees that unfinished runs automatically resume after restoring from a backup.
 - **Upgrade**: stop the platform → back up the database → replace the binary → start (the schema migrates automatically via `CREATE TABLE IF NOT EXISTS`).
   After a rolling app upgrade that changes function definitions, call `POST /api/v1/apps/sync` to sync — no platform restart needed. However, if an upgrade renamed or deleted function IDs, in-flight runs of those functions will be marked Failed by the platform after the sync (with no retry); let in-flight runs converge first, or publish under new function IDs.
 
@@ -227,7 +269,7 @@ Notes for serverless (e.g. Vercel):
    ```
    Expect `{"ids":[...],"status":200}` in return;
 3. The platform logs show `executor: run ... completed`;
-4. Confirm in the database: `sqlite3 triggerlink.db "SELECT status FROM runs;"` → `Completed`.
+4. Confirm in the database: `sqlite3 triggerlink.db "SELECT status FROM runs;"` (or `psql "$DSN" -c "SELECT status FROM runs;"`) → `Completed`.
 
 If any step fails, follow the troubleshooting order in the "Running and Troubleshooting" section of the [User Guide](user-guide.md).
 
@@ -235,4 +277,4 @@ If any step fails, follow the troubleshooting order in the "Running and Troubles
 
 - The platform is **single-replica** (SQLite single-writer), with no horizontal scaling; availability is "systemd restarts it after a crash + restart reconciliation resumes runs" (the lease defaults to 30s, i.e. a scheduling gap of at most 30s).
 - No multi-tenant isolation: all apps share one platform and one set of keys.
-- A Postgres backend and multi-replica platform are planned for later milestones.
+- A Postgres backend is available (`-db postgres://...`); **multi-replica is not** — the platform is still a single consumer of the queue regardless of backend. Postgres is the groundwork for it (the lease query is ready for `FOR UPDATE SKIP LOCKED`), not the feature itself.

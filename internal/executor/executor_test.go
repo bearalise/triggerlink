@@ -17,13 +17,13 @@ import (
 )
 
 type env struct {
-	store *SQLiteStoreAlias
+	store *SQLStoreAlias
 	reg   *registry.Registry
 	exec  *Executor
 }
 
-// SQLiteStoreAlias 避免测试文件重复写 store.SQLiteStore 长名。
-type SQLiteStoreAlias = store.SQLiteStore
+// SQLStoreAlias 避免测试文件重复写 store.SQLStore 长名。
+type SQLStoreAlias = store.SQLStore
 
 func newEnv(t *testing.T, appHandler http.HandlerFunc) *env {
 	t.Helper()

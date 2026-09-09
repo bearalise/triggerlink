@@ -23,5 +23,26 @@ services:
       - "${TRIGGERLINK_DASHBOARD_AUTH:-admin:admin}"
     restart: unless-stopped
 
+  # Postgres 后端（PRD 7.3 P1）：默认不启动，需要时 `docker compose --profile postgres up`，
+  # 并把 triggerlink 的 -db 换成 postgres://triggerlink:...@postgres:5432/triggerlink?sslmode=disable
+  postgres:
+    image: postgres:16
+    profiles: ["postgres"]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: triggerlink
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-triggerlink}
+      POSTGRES_DB: triggerlink
+    volumes:
+      - triggerlink-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U triggerlink"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
 volumes:
   triggerlink-data:
+  triggerlink-pgdata:

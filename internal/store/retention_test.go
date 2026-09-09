@@ -8,7 +8,7 @@ import (
 )
 
 // insertRunAt 造一条指定状态的 run；terminal 为真时 ended_at 设为 endedAt。
-func insertRunAt(t *testing.T, st *SQLiteStore, id, eventID, status string, endedAt *time.Time) {
+func insertRunAt(t *testing.T, st *SQLStore, id, eventID, status string, endedAt *time.Time) {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := st.CreateRun(ctx, Run{ID: id, FunctionID: "f1", Status: RunQueued,
@@ -16,21 +16,21 @@ func insertRunAt(t *testing.T, st *SQLiteStore, id, eventID, status string, ende
 		t.Fatal(err)
 	}
 	if endedAt == nil {
-		if _, err := st.db.ExecContext(ctx, `UPDATE runs SET status=? WHERE id=?`, status, id); err != nil {
+		if _, err := st.exec(ctx, `UPDATE runs SET status=? WHERE id=?`, status, id); err != nil {
 			t.Fatal(err)
 		}
 		return
 	}
-	if _, err := st.db.ExecContext(ctx,
+	if _, err := st.exec(ctx,
 		`UPDATE runs SET status=?, ended_at=? WHERE id=?`, status, fmtTime(*endedAt), id); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func countRows(t *testing.T, st *SQLiteStore, table string) int {
+func countRows(t *testing.T, st *SQLStore, table string) int {
 	t.Helper()
 	var n int
-	if err := st.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+	if err := st.queryRow(context.Background(), `SELECT COUNT(*) FROM `+table).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -94,7 +94,7 @@ func TestDeleteEventsBefore(t *testing.T) {
 			Data: json.RawMessage(`{}`), TS: old}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.db.ExecContext(ctx,
+		if _, err := st.exec(ctx,
 			`UPDATE events SET received_at=? WHERE id=?`, fmtTime(old), id); err != nil {
 			t.Fatal(err)
 		}
@@ -113,7 +113,7 @@ func TestDeleteEventsBefore(t *testing.T) {
 		t.Fatalf("deleted=%d err=%v, want 2 (evt_old + evt_done_ref)", n, err)
 	}
 	var exists int
-	if err := st.db.QueryRow(`SELECT COUNT(*) FROM events WHERE id=?`, "evt_referenced").Scan(&exists); err != nil {
+	if err := st.queryRow(context.Background(), `SELECT COUNT(*) FROM events WHERE id=?`, "evt_referenced").Scan(&exists); err != nil {
 		t.Fatal(err)
 	}
 	if exists != 1 {
@@ -141,7 +141,7 @@ func TestDeleteFinishedWaitsBefore(t *testing.T) {
 		}
 	}
 	for _, id := range []string{"wait_old_done", "wait_old_waiting"} {
-		if _, err := st.db.ExecContext(ctx, `UPDATE waits SET created_at=? WHERE id=?`, fmtTime(old), id); err != nil {
+		if _, err := st.exec(ctx, `UPDATE waits SET created_at=? WHERE id=?`, fmtTime(old), id); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -8,6 +8,22 @@ on:
 jobs:
   go:
     runs-on: ubuntu-latest
+    # 存储层与 e2e 的断言两个后端各跑一遍（同一套查询实现，见 internal/store/dialect.go），
+    # 两边行为分叉在 CI 就会暴露，而不是等到生产切换后端时。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: triggerlink
+          POSTGRES_PASSWORD: triggerlink
+          POSTGRES_DB: triggerlink
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U triggerlink"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -16,7 +32,12 @@ jobs:
           cache: true
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./... -count=1
+      - name: Test (SQLite)
+        run: go test ./... -count=1
+      - name: Test store + e2e (Postgres)
+        env:
+          TEST_POSTGRES_URI: postgres://triggerlink:triggerlink@localhost:5432/triggerlink?sslmode=disable
+        run: go test ./internal/store/... ./e2e/... -count=1
 
   sdk-ts:
     runs-on: ubuntu-latest

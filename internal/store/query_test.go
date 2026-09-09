@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func seedRunRec(t *testing.T, st *SQLiteStore, id, fnID, status, eventID string) {
+func seedRunRec(t *testing.T, st *SQLStore, id, fnID, status, eventID string) {
 	t.Helper()
 	ctx := context.Background()
 	r := Run{ID: id, FunctionID: fnID, EventID: eventID, EventName: "doc/uploaded",

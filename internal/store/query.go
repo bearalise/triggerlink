@@ -25,8 +25,8 @@ func clampLimit(n int) int {
 }
 
 // ListRuns 按 id（时间序）倒序返回 run 摘要；不填充 EventData/Output（列表页不需要大 payload）。
-func (s *SQLiteStore) ListRuns(ctx context.Context, o ListRunsOptions) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx,
+func (s *SQLStore) ListRuns(ctx context.Context, o ListRunsOptions) ([]Run, error) {
+	rows, err := s.query(ctx,
 		`SELECT id, function_id, status, event_id, event_name, attempt, created_at, ended_at
 		 FROM runs
 		 WHERE (?='' OR function_id=?) AND (?='' OR status=?) AND (?='' OR event_id=?) AND (?='' OR id<?)
@@ -67,8 +67,8 @@ type ListEventsOptions struct {
 }
 
 // ListEvents 按 id（时间序）倒序返回事件。
-func (s *SQLiteStore) ListEvents(ctx context.Context, o ListEventsOptions) ([]Event, error) {
-	rows, err := s.db.QueryContext(ctx,
+func (s *SQLStore) ListEvents(ctx context.Context, o ListEventsOptions) ([]Event, error) {
+	rows, err := s.query(ctx,
 		`SELECT id, name, data, ts, received_at FROM events
 		 WHERE (?='' OR name=?) AND (?='' OR id<?)
 		 ORDER BY id DESC LIMIT ?`,
@@ -97,7 +97,7 @@ func (s *SQLiteStore) ListEvents(ctx context.Context, o ListEventsOptions) ([]Ev
 }
 
 // RunIDsByEventIDs 反查事件触发的 run ID 列表（事件流页"触发了哪些 run"）。
-func (s *SQLiteStore) RunIDsByEventIDs(ctx context.Context, eventIDs []string) (map[string][]string, error) {
+func (s *SQLStore) RunIDsByEventIDs(ctx context.Context, eventIDs []string) (map[string][]string, error) {
 	out := map[string][]string{}
 	if len(eventIDs) == 0 {
 		return out, nil
@@ -107,7 +107,7 @@ func (s *SQLiteStore) RunIDsByEventIDs(ctx context.Context, eventIDs []string) (
 	for i, id := range eventIDs {
 		args[i] = id
 	}
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.query(ctx,
 		`SELECT event_id, id FROM runs WHERE event_id IN (`+ph+`) ORDER BY id`, args...)
 	if err != nil {
 		return nil, err
@@ -134,11 +134,12 @@ type StepRecord struct {
 	UpdatedAt *time.Time
 }
 
-// ListStepRecords 按写入序（=执行序）返回一个 run 的 step 时间线。M0 遗留行 UpdatedAt 为 nil。
-func (s *SQLiteStore) ListStepRecords(ctx context.Context, runID string) ([]StepRecord, error) {
-	rows, err := s.db.QueryContext(ctx,
+// ListStepRecords 按写入序（=执行序）返回一个 run 的 step 时间线。M0 遗留行 UpdatedAt 为 nil、
+// seq 为 0，回落到按 updated_at 排（尽力而为，与加 seq 列之前的行为一致）。
+func (s *SQLStore) ListStepRecords(ctx context.Context, runID string) ([]StepRecord, error) {
+	rows, err := s.query(ctx,
 		`SELECT step_id, op, status, output, error, attempt, updated_at
-		 FROM step_runs WHERE run_id=? ORDER BY rowid`, runID)
+		 FROM step_runs WHERE run_id=? ORDER BY seq, updated_at`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -174,8 +175,8 @@ type FunctionStat struct {
 }
 
 // FunctionStats24h 聚合 since 之后创建的 run，按键 function_id 返回。
-func (s *SQLiteStore) FunctionStats24h(ctx context.Context, since time.Time) (map[string]FunctionStat, error) {
-	rows, err := s.db.QueryContext(ctx,
+func (s *SQLStore) FunctionStats24h(ctx context.Context, since time.Time) (map[string]FunctionStat, error) {
+	rows, err := s.query(ctx,
 		`SELECT function_id, status, COUNT(*) FROM runs WHERE created_at>=? GROUP BY function_id, status`,
 		fmtTime(since))
 	if err != nil {

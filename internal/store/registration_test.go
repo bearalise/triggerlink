@@ -51,7 +51,7 @@ func TestRegisteredFunctionFlowControlLegacyRow(t *testing.T) {
 	st := openTemp(t)
 	ctx := context.Background()
 	// 模拟老行：直接写入不含新列的记录
-	if _, err := st.db.ExecContext(ctx,
+	if _, err := st.exec(ctx,
 		`INSERT INTO functions (id, app_url, event, retries, updated_at) VALUES (?,?,?,?,?)`,
 		"legacy", "http://a/serve", "x/y", 0, fmtTime(time.Now())); err != nil {
 		t.Fatal(err)

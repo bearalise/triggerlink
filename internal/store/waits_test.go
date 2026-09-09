@@ -8,7 +8,7 @@ import (
 )
 
 // seedWaitRun 造一个 Running run 供 wait 挂靠。
-func seedWaitRun(t *testing.T, st *SQLiteStore, id, fnID string) {
+func seedWaitRun(t *testing.T, st *SQLStore, id, fnID string) {
 	t.Helper()
 	if _, err := st.CreateRun(context.Background(), Run{ID: id, FunctionID: fnID, Status: RunQueued,
 		EventID: "evt_t", EventName: "order/created", EventData: json.RawMessage(`{"order_id":"o1"}`), EventTS: time.Now()}); err != nil {
