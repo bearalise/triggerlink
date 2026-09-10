@@ -400,3 +400,161 @@ test("lifecycle.onResponse 抛错:视同 step 失败", async () => {
   });
   await assert.rejects(drive(agent, "q"), /StepError: hook boom/);
 });
+
+
+test("prepareMessages:每轮 generateText 前裁剪历史,返回值成为正式历史", async () => {
+  const model = new MockLanguageModelV4({
+    doGenerate: [
+      toolCallsResult([{ id: "c1", name: "search", input: { query: "x" } }]),
+      textResult("final", 20, 8),
+    ],
+  });
+  const agent = createAgent({
+    name: "pm1",
+    model,
+    tools: { search: searchTool(() => "r") },
+    // 只保留最后两条消息（assistant tool-call + tool result 成组）,裁掉最初的 user 消息
+    prepareMessages: ({ messages }) => messages.slice(-2),
+  });
+
+  const { result } = await drive(agent, "original question");
+  assert.equal(result.text, "final");
+  // 第二次 LLM 调用看到的是裁剪后的历史:不含最初的 user 消息
+  const prompt = model.doGenerateCalls[1].prompt;
+  assert.deepEqual(prompt.map((m) => m.role), ["assistant", "tool"]);
+  // 裁剪结果即正式历史:result.output 同样不含最初的 user 消息
+  assert.deepEqual(result.output.map((m) => m.role), ["assistant", "tool", "assistant"]);
+  // 工具执行记录不受裁剪影响,始终完整
+  assert.deepEqual(result.toolCalls, [
+    { toolCallId: "c1", toolName: "search", input: { query: "x" }, output: "r" },
+  ]);
+});
+
+test("prepareMessages:iteration 与 previousUsage 入参(首轮 undefined),重放重入同样触发", async () => {
+  const model = new MockLanguageModelV4({
+    doGenerate: [
+      toolCallsResult([{ id: "c1", name: "search", input: { query: "x" } }]),
+      textResult("final", 20, 8),
+    ],
+  });
+  const seen = [];
+  const agent = createAgent({
+    name: "pm2",
+    model,
+    tools: { search: searchTool(() => "r") },
+    prepareMessages: ({ messages, iteration, previousUsage }) => {
+      seen.push({ iteration, previousUsage, length: messages.length });
+      return messages;
+    },
+  });
+
+  const { result } = await drive(agent, "q");
+  assert.equal(result.text, "final");
+  // 平台每推进一个 step 就整体重入,钩子每次重入都跑;最后一次完整重入的两轮是最终状态
+  const [first, second] = seen.slice(-2);
+  assert.equal(first.iteration, 0);
+  assert.equal(first.previousUsage, undefined);
+  assert.equal(first.length, 1); // 首轮只有 user 消息
+  assert.equal(second.iteration, 1);
+  assert.deepEqual(second.previousUsage, { inputTokens: 10, outputTokens: 5 });
+  assert.equal(second.length, 3); // user + assistant(tool-call) + tool(result)
+});
+
+test("prepareMessages 破坏 tool-call/tool-result 配对或返回空历史:fail loud 并指名钩子", async () => {
+  const dangling = createAgent({
+    name: "pm3",
+    model: new MockLanguageModelV4({
+      doGenerate: [
+        toolCallsResult([{ id: "c1", name: "search", input: { query: "x" } }]),
+        textResult("final"),
+      ],
+    }),
+    tools: { search: searchTool(() => "r") },
+    // 第二轮裁掉 tool result,留下孤儿 tool-call
+    prepareMessages: ({ messages }) => messages.filter((m) => m.role !== "tool"),
+  });
+  await assert.rejects(
+    drive(dangling, "q"),
+    /agent "pm3": prepareMessages returned an invalid message list \(assistant tool-call\(s\) without tool-result: c1\)/,
+  );
+
+  const orphan = createAgent({
+    name: "pm4",
+    model: new MockLanguageModelV4({
+      doGenerate: [
+        toolCallsResult([{ id: "c1", name: "search", input: { query: "x" } }]),
+        textResult("final"),
+      ],
+    }),
+    tools: { search: searchTool(() => "r") },
+    // 第二轮裁掉 assistant 消息,留下孤儿 tool-result
+    prepareMessages: ({ messages }) => messages.filter((m) => m.role !== "assistant"),
+  });
+  await assert.rejects(
+    drive(orphan, "q"),
+    /agent "pm4": prepareMessages returned an invalid message list \(tool-result "c1" has no preceding assistant tool-call\)/,
+  );
+
+  const empty = createAgent({
+    name: "pm5",
+    model: new MockLanguageModelV4({ doGenerate: textResult("x") }),
+    prepareMessages: () => [],
+  });
+  await assert.rejects(
+    drive(empty, "q"),
+    /agent "pm5": prepareMessages returned an invalid message list \(must be a non-empty array\)/,
+  );
+});
+
+test("prepareMessages:replay 走相同逻辑,恢复后模型看到裁剪结果", async () => {
+  const hash = (stepId, seq) =>
+    createHash("sha256").update(`${FN_ID}:${stepId}:${seq}`).digest("hex");
+  const preseeded = {
+    [hash("agent/pm6", 0)]: {
+      id: "agent/pm6",
+      status: "completed",
+      output: {
+        text: "",
+        toolCalls: [{ toolCallId: "c1", toolName: "search", input: { query: "x" } }],
+        responseMessages: [
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "c1", toolName: "search", input: { query: "x" } },
+            ],
+          },
+        ],
+        usage: { inputTokens: 10, outputTokens: 5 },
+      },
+    },
+    [hash("agent/pm6/search", 0)]: { id: "agent/pm6/search", status: "completed", output: "r" },
+  };
+
+  const calls = [];
+  const model = new MockLanguageModelV4({ doGenerate: textResult("resumed", 20, 8) });
+  const agent = createAgent({
+    name: "pm6",
+    model,
+    tools: {
+      search: searchTool(() => {
+        throw new Error("tool handler must not re-run on replay");
+      }),
+    },
+    // 确定性变换:压缩最早的 user 消息;恢复重入时逐轮重放,产出与首次执行一致
+    prepareMessages: ({ messages, iteration, previousUsage }) => {
+      calls.push({ iteration, previousUsage });
+      return messages.map((m) => (m.role === "user" ? { ...m, content: "condensed" } : m));
+    },
+  });
+
+  const { result } = await drive(agent, "q", preseeded);
+  assert.equal(result.text, "resumed");
+  assert.equal(model.doGenerateCalls.length, 1); // 只有第二次 LLM 调用真实执行
+  // 重放路径上钩子对 memo 命中的第 0 轮同样触发,且能拿到 memo 里的 usage
+  assert.deepEqual(calls.at(-2), { iteration: 0, previousUsage: undefined });
+  assert.deepEqual(calls.at(-1), { iteration: 1, previousUsage: { inputTokens: 10, outputTokens: 5 } });
+  // 恢复后模型看到的历史:裁剪生效(user 被压缩),配对保持(assistant tool-call + tool result)
+  const prompt = model.doGenerateCalls[0].prompt;
+  assert.deepEqual(prompt.map((m) => m.role), ["user", "assistant", "tool"]);
+  assert.deepEqual(prompt[0].content, [{ type: "text", text: "condensed" }]);
+});

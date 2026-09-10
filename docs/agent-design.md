@@ -90,6 +90,7 @@ interface AgentOpts {
   tools?: Record<string, AgentTool>;
   maxIterations?: number;              // default 10; throws (RunError) when exceeded
   maxOutputTokens?: number;            // per-LLM-call output token cap, passed through to generateText
+  prepareMessages?: PrepareMessagesHook; // opt-in; sync deterministic history transform before each LLM call (see §5.8)
   redact?: RedactHook;                 // opt-in; transforms step output before persistence (see §5.7)
   lifecycle?: {
     // fired once per *actual* LLM call, inside the llm step (after redact+validate):
@@ -106,6 +107,13 @@ interface RedactCtx {
   toolName?: string;                   // set when kind === "tool"
 }
 type RedactHook = (output: unknown, ctx: RedactCtx) => unknown;
+
+interface PrepareMessagesCtx {
+  messages: readonly TextMessage[];      // full working history so far
+  iteration: number;                     // agent loop iteration (0-based)
+  previousUsage?: { inputTokens?: number; outputTokens?: number }; // previous LLM call (undefined on the first)
+}
+type PrepareMessagesHook = (ctx: PrepareMessagesCtx) => TextMessage[];
 
 interface Agent {
   readonly name: string;
@@ -222,6 +230,23 @@ Same for `tool` steps (with `toolName` in the context). One hook covers both kin
 
 Default: no hook, output persisted as-is (documented plainly so the leak surface is a conscious choice).
 
+### 5.8 prepareMessages hook (context compaction)
+
+**Decided: opt-in, synchronous, deterministic.** Each `generateText` call sees the full reconstructed history, which grows unboundedly across iterations (§5.4). `createAgent` accepts a `prepareMessages` hook applied to the message list **before** each iteration's `llm` step; the returned list replaces the working history, so it is both what the model sees this iteration and the base onto which later turns are appended:
+
+```
+for i in 0..maxIterations-1:
+  messages = prepareMessages?.({ messages, iteration: i, previousUsage }) ?? messages
+  resp = await step.run(`agent/${name}`, () => generateText({ ..., messages, ... }))
+```
+
+Contract (same family as `redact`, §5.7):
+
+- **Synchronous, no I/O, deterministic**: the hook re-runs on every recovery re-entry (history is rebuilt from memos, then the hook re-applies at the same line), so non-determinism would drift the reconstructed history. It changes message *content* only, never the step sequence — memo keys are unaffected, so durable replay needs no platform changes.
+- **Pairing preserved**: every assistant `tool-call` must keep its matching `tool-result` and vice versa. The SDK validates the returned list and throws naming the hook (fail loud), rather than letting `generateText` fail obscurely on orphaned parts.
+- `previousUsage` carries the previous iteration's token usage (available on memo-hit replays too), enabling usage-triggered compaction without extra plumbing.
+- `AgentResult.output` reflects the prepared (compacted) history; `AgentResult.toolCalls` remains the complete record of every tool execution.
+
 ## 6. Observability
 
 No new machinery: each `llm`/`tool` step appears in the dashboard's run detail with its memo output — the LLM response (including token usage) and each tool result. This gives per-call tracing, latency (step timestamps), and cost attribution for free, comparable to what AgentKit advertises as built-in tracing.
@@ -230,7 +255,7 @@ The `llm` step memo output includes `usage` per call; `AgentResult.usage` aggreg
 
 ## 7. Testing Strategy
 
-- **Unit** (`sdk-ts/test/agent.test.mjs`): drive the loop with the AI SDK's `MockLanguageModelV2` (`ai/test`) — scripted responses: (a) text-only finish, (b) tool call → tool result → finish, (c) multi-tool-call ordering, (d) `maxIterations` guard, (e) `redact` hook transforms persisted output and rejects structural damage to `llm` memos.
+- **Unit** (`sdk-ts/test/agent.test.mjs`): drive the loop with the AI SDK's `MockLanguageModelV2` (`ai/test`) — scripted responses: (a) text-only finish, (b) tool call → tool result → finish, (c) multi-tool-call ordering, (d) `maxIterations` guard, (e) `redact` hook transforms persisted output and rejects structural damage to `llm` memos, (f) `prepareMessages` transforms the history seen by each LLM call, receives correct `iteration`/`previousUsage`, and rejects unpaired tool-call/tool-result lists.
 - **Replay test**: simulate memo injection by pre-seeding an `ExecCtx` with completed `llm`/`tool` memos and assert the loop resumes at the right call without re-invoking the mock model — this is the core durability property.
 - **E2E** (optional, follows existing `e2e/` patterns): a 2-iteration agent against a mock model inside a real platform+app round trip, with a kill-and-resume between iterations.
 
