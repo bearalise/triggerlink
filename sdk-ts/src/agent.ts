@@ -67,6 +67,27 @@ export interface RedactCtx {
  */
 export type RedactHook = (output: unknown, ctx: RedactCtx) => unknown;
 
+/** prepareMessages 钩子的上下文（§5.8）。 */
+export interface PrepareMessagesCtx {
+  /** 当前对话历史（本轮之前的全部 user/assistant/tool 消息） */
+  messages: readonly TextMessage[];
+  /** Agent 循环迭代号（0 起） */
+  iteration: number;
+  /** 上一轮 LLM 调用的 token 用量；首轮为 undefined */
+  previousUsage?: { inputTokens?: number; outputTokens?: number };
+}
+
+/**
+ * 调用前历史变换钩子：在每轮 generateText 之前同步调用，返回值替换对话历史——
+ * 既喂给本轮 LLM，也成为后续轮次的正式历史（典型用途：上下文压缩/裁剪）。
+ * 必须是纯函数：同步、不执行 I/O、确定（同输入同输出）——恢复重放时历史由 memo
+ * 重建后本钩子会重新应用，非确定性会使重建的历史漂移。只改消息内容，不改 step
+ * 序列，memo 键不受影响。返回的序列必须保持 assistant tool-call 与 tool-result
+ * 成组（每个 tool-call 有对应 tool-result，反之亦然），否则抛错
+ * （见 assertPreparedMessagesShape）。
+ */
+export type PrepareMessagesHook = (ctx: PrepareMessagesCtx) => TextMessage[];
+
 /** 单轮 LLM 调用的结果（lifecycle.onResponse 的入参）。 */
 export interface AgentIterationResult {
   /** 本轮 assistant 文本 */
@@ -101,6 +122,8 @@ export interface AgentOpts {
   maxIterations?: number;
   /** 每次 LLM 调用的最大输出 token 数，透传给 generateText；不设则由模型/provider 决定 */
   maxOutputTokens?: number;
+  /** 每轮 generateText 前的同步历史变换（§5.8）；返回值成为后续轮次的正式历史 */
+  prepareMessages?: PrepareMessagesHook;
   redact?: RedactHook;
   lifecycle?: AgentLifecycle;
 }
@@ -121,7 +144,8 @@ export interface AgentResult {
   /**
    * 完整对话历史（user 输入 + 各轮 assistant 消息 + 工具结果），字段名与 AgentKit
    * 的 result.output 对齐——可自行 findLastIndex 等遍历（元素含 role/content）。
-   * 恢复重放时由 memo 原样重建；启用 redact 时历史内容即脱敏后内容。
+   * 恢复重放时由 memo 原样重建；启用 redact 时历史内容即脱敏后内容；启用
+   * prepareMessages 时为裁剪后的正式历史（toolCalls 记录不受影响，始终完整）。
    */
   output: TextMessage[];
 }
@@ -181,6 +205,37 @@ function assertLlmMemoShape(m: unknown, name: string): asserts m is LlmMemo {
   }
 }
 
+/**
+ * prepareMessages 返回值的结构校验（§5.8）：非空、角色合法、assistant tool-call 与
+ * tool-result 成组。坏历史会让下一轮 generateText 以更难懂的方式失败，此处 fail loud
+ * 并指名钩子。
+ */
+function assertPreparedMessagesShape(msgs: unknown, name: string): asserts msgs is TextMessage[] {
+  const bad = (why: string): Error =>
+    new Error(`agent "${name}": prepareMessages returned an invalid message list (${why})`);
+  if (!Array.isArray(msgs) || msgs.length === 0) throw bad("must be a non-empty array");
+  const pending = new Set<string>(); // 已出现、尚未配对 tool-result 的 tool-call id
+  for (const m of msgs as Array<{ role?: unknown; content?: unknown }>) {
+    if (!m || (m.role !== "user" && m.role !== "assistant" && m.role !== "tool")) {
+      throw bad('roles must be "user" | "assistant" | "tool" (system lives in AgentOpts.system)');
+    }
+    if (!Array.isArray(m.content)) continue; // 字符串 content 无 parts，无可配对项
+    for (const p of m.content as Array<{ type?: string; toolCallId?: unknown }>) {
+      if (m.role === "assistant" && p?.type === "tool-call" && typeof p.toolCallId === "string") {
+        pending.add(p.toolCallId);
+      }
+      if (m.role === "tool" && p?.type === "tool-result" && typeof p.toolCallId === "string") {
+        if (!pending.delete(p.toolCallId)) {
+          throw bad(`tool-result "${p.toolCallId}" has no preceding assistant tool-call`);
+        }
+      }
+    }
+  }
+  if (pending.size > 0) {
+    throw bad(`assistant tool-call(s) without tool-result: ${[...pending].join(", ")}`);
+  }
+}
+
 // 同一函数调用（每次回调都是一个新 StepTool 实例）内 agent 名 → 实例的登记簿，
 // 用于拒绝两个不同 Agent 共用 name 造成的 memo 键前缀冲突（§5.2）。
 // 同一个 Agent 实例多次 run（如循环里）是合法的：ExecCtx 序号机制保证 memo 键确定。
@@ -229,14 +284,25 @@ export function createAgent(opts: AgentOpts): Agent {
       registry.set(agent.name, agent);
 
       const redact = opts.redact;
+      const prepareMessages = opts.prepareMessages;
       const llmStepId = `agent/${agent.name}`;
-      const messages: TextMessage[] = [{ role: "user", content: input }];
+      let messages: TextMessage[] = [{ role: "user", content: input }];
+      let prevUsage: { inputTokens?: number; outputTokens?: number } | undefined;
       const usage = { inputTokens: 0, outputTokens: 0 };
       const toolCalls: AgentToolCallRecord[] = [];
 
       for (let i = 0; ; i++) {
         if (i >= maxIterations) {
           throw new Error(`agent "${agent.name}": maxIterations (${maxIterations}) exceeded`);
+        }
+
+        // prepareMessages：同步、确定的调用前历史变换（§5.8）。在历史由 memo 重建之后、
+        // 本轮响应追加之前应用，因此恢复重放走同一代码路径并产出相同历史；
+        // 只改消息内容，不改 step 序列，memo 键不受影响。
+        if (prepareMessages) {
+          const prepared = prepareMessages({ messages, iteration: i, previousUsage: prevUsage });
+          assertPreparedMessagesShape(prepared, agent.name);
+          messages = prepared;
         }
 
         const llmMemo = await step.run(llmStepId, async () => {
@@ -276,6 +342,7 @@ export function createAgent(opts: AgentOpts): Agent {
 
         usage.inputTokens += llmMemo.usage.inputTokens ?? 0;
         usage.outputTokens += llmMemo.usage.outputTokens ?? 0;
+        prevUsage = llmMemo.usage; // memo 命中路径同样赋值：重放时 prepareMessages 入参一致
         messages.push(...llmMemo.responseMessages);
 
         if (llmMemo.toolCalls.length === 0) {

@@ -180,6 +180,14 @@ Notes:
   persistence, e.g. to strip secrets or PII from memos. It must be deterministic and
   replay-safe — the memo is what the model sees of its own prior turns after a crash-resume:
   `redact: (output, ctx) => ...` with `ctx = { kind: "llm" | "tool", iteration, toolName? }`.
+- **`prepareMessages` hook** (optional): synchronous history transform applied before each
+  `generateText` call — the typical use is context compaction/trimming. The returned list
+  becomes the official history for later turns (and for `AgentResult.output`), while
+  `result.toolCalls` stays the complete record. It receives
+  `{ messages, iteration, previousUsage }` and must be pure and deterministic — it re-runs
+  on crash-resume replays — and must keep every assistant tool-call paired with its
+  tool-result (the SDK validates the returned list and throws otherwise):
+  `prepareMessages: ({ messages }) => messages.slice(-8)`.
 - **Constraints**: same as any function — a single LLM call must finish within the platform
   callback timeout (5 minutes by default); two different agents in one function must have
   different `name`s; changing the tool set or loop structure between retries of the same run
