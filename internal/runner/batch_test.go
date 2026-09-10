@@ -55,10 +55,12 @@ func TestBatchFlushesOnSize(t *testing.T) {
 }
 
 // 攒不满时由 timeout 兜底 flush（scanBatchTimeouts）。
+// timeout 余量要远大于"路由两条事件 + 一次扫描"的开销：20ms 级别在慢 CI/高负载机器上
+// 会在首次扫描前就已过期，导致 runs=1 的误报（deflake）。
 func TestBatchFlushesOnTimeout(t *testing.T) {
 	r, st := setupDebounce(t, registry.Function{ID: "bulk-index", Event: "doc/changed",
 		AppURL: "http://app/serve",
-		Batch:  &registry.Batch{MaxSize: 100, Timeout: 20 * time.Millisecond}})
+		Batch:  &registry.Batch{MaxSize: 100, Timeout: 500 * time.Millisecond}})
 	ctx := context.Background()
 
 	routeAll(t, r, st, event("evt_1", "d1"), event("evt_2", "d2"))
@@ -67,7 +69,7 @@ func TestBatchFlushesOnTimeout(t *testing.T) {
 		t.Fatalf("runs=%d, want 0 before the timeout elapses", n)
 	}
 
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
 	r.scanBatchTimeouts(ctx)
 
 	if n, _ := st.CountRuns(ctx); n != 1 {
