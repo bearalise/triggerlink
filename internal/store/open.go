@@ -28,8 +28,10 @@ func isPostgresURI(uri string) bool {
 }
 
 // OpenSQLite 打开 SQLite 库。单连接：SQLite 单写者，避免 SQLITE_BUSY 抖动。
+// synchronous(NORMAL)：WAL 模式下普通提交不逐次 fsync，进程崩溃不丢数据，
+// 仅整机断电可能丢最后几毫秒已提交事务；换得写吞吐数量级提升。
 func OpenSQLite(path string) (*SQLStore, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
