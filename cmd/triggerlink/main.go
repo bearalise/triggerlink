@@ -235,7 +235,17 @@ func main() {
 	// Prometheus 抓取端点：按惯例公开（不套 basic auth）；公网部署应在反代层限制来源。
 	mux.Handle("/metrics", metrics.Handler())
 	mux.Handle("/dashboard/", secure(dashboard.Handler()))
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+		// ReadHeaderTimeout 防 Slowloris 慢头攻击；ReadTimeout 覆盖请求体读取，
+		// 防慢速 body 长期占用连接 goroutine。WriteTimeout 需宽于 stream 背压下
+		// 的最坏排队时间：缓冲 1024 条 + 单连接落库时，一批事件可能排队数十秒。
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

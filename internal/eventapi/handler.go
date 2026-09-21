@@ -42,7 +42,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var raw json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+	// 限 4MB 防滥用（与 webhook 端点一致）；超限 Decode 返回错误，按 400 处理
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&raw); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
